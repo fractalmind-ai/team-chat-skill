@@ -173,6 +173,38 @@ class TeamChatServiceTests(unittest.TestCase):
             if payload_message:
                 self.assertEqual("trace_a", payload_message.get("trace_id"))
 
+    def test_rejects_team_path_traversal(self) -> None:
+        with self.assertRaises(ValueError):
+            self.service.init_team("../escape", members=["lead"])
+
+    def test_rejects_agent_path_traversal(self) -> None:
+        with self.assertRaises(ValueError):
+            self.service.read(self.team, agent="../escape", unread_only=False, limit=10)
+
+    def test_rejects_sender_or_recipient_path_traversal(self) -> None:
+        with self.assertRaises(ValueError):
+            self.service.send(
+                self.team,
+                {
+                    "id": "msg_bad_1",
+                    "type": "handoff",
+                    "from": "../lead",
+                    "to": "dev",
+                    "payload": {"note": "bad"},
+                },
+            )
+        with self.assertRaises(ValueError):
+            self.service.send(
+                self.team,
+                {
+                    "id": "msg_bad_2",
+                    "type": "handoff",
+                    "from": "lead",
+                    "to": "../../dev",
+                    "payload": {"note": "bad"},
+                },
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

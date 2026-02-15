@@ -13,7 +13,7 @@ from uuid import uuid4
 
 import fcntl
 
-from protocol import parse_iso_utc
+from protocol import parse_iso_utc, validate_identifier
 
 
 DEFAULT_ACK_POLICY: dict[str, dict[str, int]] = {
@@ -26,8 +26,8 @@ DEFAULT_ACK_POLICY: dict[str, dict[str, int]] = {
 class TeamStore:
     def __init__(self, base_dir: Path, team: str):
         self.base_dir = Path(base_dir)
-        self.team = team
-        self.team_dir = self.base_dir / "teams" / team
+        self.team = validate_identifier(team, field_name="team")
+        self.team_dir = self.base_dir / "teams" / self.team
         self.inboxes_dir = self.team_dir / "inboxes"
         self.events_dir = self.team_dir / "events"
         self.tasks_dir = self.team_dir / "tasks"
@@ -128,7 +128,8 @@ class TeamStore:
         }
 
     def _inbox_path(self, agent: str) -> Path:
-        return self.inboxes_dir / f"{agent}.jsonl"
+        safe_agent = validate_identifier(agent, field_name="agent")
+        return self.inboxes_dir / f"{safe_agent}.jsonl"
 
     def upsert_message(self, message: dict[str, Any]) -> bool:
         self.ensure_layout()

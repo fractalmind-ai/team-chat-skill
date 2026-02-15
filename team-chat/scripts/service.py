@@ -8,7 +8,14 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from protocol import new_event, normalize_message, parse_iso_utc, sort_key_by_created_at, utc_now_iso
+from protocol import (
+    new_event,
+    normalize_message,
+    parse_iso_utc,
+    sort_key_by_created_at,
+    utc_now_iso,
+    validate_identifier,
+)
 from storage import TeamStore
 
 
@@ -29,6 +36,7 @@ class TeamChatService:
 
         members = members or []
         for member in members:
+            validate_identifier(member, field_name="member")
             (store.inboxes_dir / f"{member}.jsonl").touch(exist_ok=True)
 
         if not store.team_meta_path.exists():
@@ -190,48 +198,50 @@ class TeamChatService:
         store = self.store(team)
         store.ensure_layout()
 
-        messages = store.list_messages_for_agent(agent, unread_only=unread_only, limit=limit)
+        safe_agent = validate_identifier(agent, field_name="agent")
+        messages = store.list_messages_for_agent(safe_agent, unread_only=unread_only, limit=limit)
         read_event = new_event(
             kind="inbox_read",
             team=team,
             payload={
-                "agent": agent,
+                "agent": safe_agent,
                 "count": len(messages),
                 "unread_only": unread_only,
             },
         )
         store.append_event(read_event)
 
-        return {"team": team, "agent": agent, "messages": messages, "count": len(messages)}
+        return {"team": team, "agent": safe_agent, "messages": messages, "count": len(messages)}
 
     def ack(self, team: str, *, agent: str, message_id: str) -> dict[str, Any]:
         store = self.store(team)
         store.ensure_layout()
+        safe_agent = validate_identifier(agent, field_name="agent")
 
         message = store.get_message(message_id)
         if not message:
             reject_event = new_event(
                 kind="ack_rejected",
                 team=team,
-                payload={"agent": agent, "message_id": message_id, "reason": "message_not_found"},
+                payload={"agent": safe_agent, "message_id": message_id, "reason": "message_not_found"},
             )
             store.append_event(reject_event)
             return {"status": "not_found", "message_id": message_id}
 
-        if message.get("to") != agent:
+        if message.get("to") != safe_agent:
             reject_event = new_event(
                 kind="ack_rejected",
                 team=team,
                 trace_id=message.get("trace_id"),
                 task_id=message.get("task_id"),
-                payload={"agent": agent, "message_id": message_id, "reason": "wrong_recipient"},
+                payload={"agent": safe_agent, "message_id": message_id, "reason": "wrong_recipient"},
             )
             store.append_event(reject_event)
             return {"status": "wrong_recipient", "message_id": message_id, "expected": message.get("to")}
 
         created = store.record_ack(
             message_id,
-            agent=agent,
+            agent=safe_agent,
             acked_at=utc_now_iso(),
             delivery_id=message.get("delivery_id"),
         )
@@ -242,14 +252,14 @@ class TeamChatService:
             team=team,
             trace_id=message.get("trace_id"),
             task_id=message.get("task_id"),
-            payload={"agent": agent, "message_id": message_id},
+            payload={"agent": safe_agent, "message_id": message_id},
         )
         store.append_event(ack_event)
 
         return {
             "status": "acked" if created else "already_acked",
             "message_id": message_id,
-            "agent": agent,
+            "agent": safe_agent,
         }
 
     def status(self, team: str, *, stale_minutes: int = 90) -> dict[str, Any]:

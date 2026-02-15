@@ -30,6 +30,13 @@ $CLI trace demo --trace-id tr_1
 python3 -m unittest discover -s tests -v
 ```
 
+## Identifier Safety
+
+For write-path safety, `team`, `from`, `to`, and `agent` identifiers must match:
+
+- `^[A-Za-z0-9._-]+$`
+- No `/`, `\\`, or `..` traversal segments
+
 ## Skill Doc
 
 See `team-chat/SKILL.md` for full protocol and CLI reference.

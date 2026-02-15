@@ -91,3 +91,4 @@ Supported message types:
 - Timeout + retry + dead-letter: `send --require-ack` applies per-type policy.
 - Rehydrate: rebuild task/index state from append-only logs.
 - Nudge cooldown: `send --cooldown-seconds` suppresses spam repeats.
+- Path safety: `team`, `from`, `to`, and `agent` must match `^[A-Za-z0-9._-]+$` and cannot contain path separators/traversal tokens.

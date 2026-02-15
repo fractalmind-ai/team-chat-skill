@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import re
 from typing import Any
 from uuid import uuid4
 
@@ -25,6 +26,7 @@ MESSAGE_TYPES = {
 }
 
 PRIORITIES = {"low", "normal", "high", "critical"}
+IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 def utc_now_iso() -> str:
@@ -41,6 +43,22 @@ def parse_iso_utc(value: str) -> datetime:
 
 def _id(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex[:12]}"
+
+
+def validate_identifier(value: Any, *, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")
+
+    normalized = value.strip()
+    if "/" in normalized or "\\" in normalized:
+        raise ValueError(f"{field_name} contains path separator")
+    if normalized in {".", ".."} or ".." in normalized:
+        raise ValueError(f"{field_name} contains invalid traversal token")
+    if not IDENTIFIER_RE.fullmatch(normalized):
+        raise ValueError(
+            f"{field_name} must match pattern {IDENTIFIER_RE.pattern}"
+        )
+    return normalized
 
 
 def normalize_message(payload: dict[str, Any]) -> dict[str, Any]:
@@ -73,9 +91,10 @@ def validate_message(message: dict[str, Any]) -> None:
         raise ValueError(f"Unsupported message type: {msg_type}. Supported: {supported}")
 
     for endpoint in ("from", "to"):
-        value = message.get(endpoint)
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError(f"message.{endpoint} must be a non-empty string")
+        message[endpoint] = validate_identifier(
+            message.get(endpoint),
+            field_name=f"message.{endpoint}",
+        )
 
     if not isinstance(message.get("payload"), dict):
         raise ValueError("message.payload must be an object")
