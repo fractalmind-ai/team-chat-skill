@@ -246,6 +246,41 @@ class TeamChatServiceTests(unittest.TestCase):
         self.assertGreaterEqual(page3["count"], 1)
         self.assertIsNone(page3["next_cursor"])
 
+    def test_trace_cursor_pagination_no_duplicates_against_full_trace(self) -> None:
+        for i in range(30):
+            self.service.send(
+                self.team,
+                {
+                    "id": f"msg_trace_reg_{i}",
+                    "type": "handoff",
+                    "from": "lead",
+                    "to": "dev",
+                    "trace_id": "trace_regression",
+                    "payload": {"seq": i},
+                },
+            )
+
+        full = self.service.trace(self.team, trace_id="trace_regression", limit=0)
+        full_ids = [event["id"] for event in full["events"]]
+
+        paged_ids: list[str] = []
+        cursor = None
+        while True:
+            page = self.service.trace(
+                self.team,
+                trace_id="trace_regression",
+                limit=7,
+                cursor=cursor,
+            )
+            paged_ids.extend([event["id"] for event in page["events"]])
+            cursor = page.get("next_cursor")
+            if not cursor:
+                break
+
+        self.assertEqual(len(full_ids), len(paged_ids))
+        self.assertEqual(len(set(full_ids)), len(set(paged_ids)))
+        self.assertEqual(set(full_ids), set(paged_ids))
+
     def test_ack_fallback_works_without_index_offset(self) -> None:
         self.service.send(
             self.team,

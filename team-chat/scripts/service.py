@@ -376,7 +376,6 @@ class TeamChatService:
         page_reverse = collected[:clamped_limit]
         has_more = len(collected) > clamped_limit
         page = list(reversed(page_reverse))
-        page.sort(key=sort_key_by_created_at)
 
         next_cursor = None
         if has_more and page:
