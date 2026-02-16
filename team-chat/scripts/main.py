@@ -46,6 +46,9 @@ def _print(data: dict, as_json: bool) -> None:
                 f"- {message.get('id')} [{message.get('type')}] "
                 f"{message.get('from')} -> {message.get('to')}"
             )
+        next_cursor = data.get("next_cursor")
+        if isinstance(next_cursor, str) and next_cursor:
+            print(f"next_cursor: {next_cursor}")
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -134,6 +137,7 @@ def cmd_read(args: argparse.Namespace) -> int:
         agent=args.agent,
         unread_only=args.unread,
         limit=args.limit,
+        cursor=args.cursor,
     )
     _print(result, args.json)
     return 0
@@ -183,7 +187,12 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_trace(args: argparse.Namespace) -> int:
     service = TeamChatService(Path(args.data_root))
-    result = service.trace(args.team, trace_id=args.trace_id)
+    result = service.trace(
+        args.team,
+        trace_id=args.trace_id,
+        limit=args.limit,
+        cursor=args.cursor,
+    )
     if args.json:
         _print(result, True)
         return 0
@@ -195,6 +204,8 @@ def cmd_trace(args: argparse.Namespace) -> int:
             f"- {event.get('created_at')} {event.get('kind')} "
             f"id={event.get('id')} task={event.get('task_id', '-') }"
         )
+    if result.get("next_cursor"):
+        print(f"next_cursor: {result['next_cursor']}")
     return 0
 
 
@@ -273,6 +284,7 @@ def build_parser() -> argparse.ArgumentParser:
     read_parser.add_argument("--agent", required=True)
     read_parser.add_argument("--unread", action="store_true")
     read_parser.add_argument("--limit", type=int, default=50)
+    read_parser.add_argument("--cursor", help="Read messages older than this message id")
     read_parser.set_defaults(func=cmd_read)
 
     ack_parser = subparsers.add_parser("ack", help="Acknowledge message")
@@ -289,6 +301,8 @@ def build_parser() -> argparse.ArgumentParser:
     trace_parser = subparsers.add_parser("trace", help="Trace events by trace_id")
     trace_parser.add_argument("team")
     trace_parser.add_argument("--trace-id", required=True)
+    trace_parser.add_argument("--limit", type=int, default=0, help="0 means no limit")
+    trace_parser.add_argument("--cursor", help="Read events older than this event id")
     trace_parser.set_defaults(func=cmd_trace)
 
     rehydrate_parser = subparsers.add_parser("rehydrate", help="Rebuild indexes/snapshots from logs")

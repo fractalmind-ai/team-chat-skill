@@ -173,6 +173,136 @@ class TeamChatServiceTests(unittest.TestCase):
             if payload_message:
                 self.assertEqual("trace_a", payload_message.get("trace_id"))
 
+    def test_read_cursor_pagination(self) -> None:
+        for i in range(1, 6):
+            self.service.send(
+                self.team,
+                {
+                    "id": f"msg_page_{i}",
+                    "type": "handoff",
+                    "from": "lead",
+                    "to": "dev",
+                    "payload": {"seq": i},
+                },
+            )
+
+        page1 = self.service.read(self.team, agent="dev", unread_only=False, limit=2)
+        self.assertEqual(["msg_page_4", "msg_page_5"], [m["id"] for m in page1["messages"]])
+        self.assertEqual("msg_page_4", page1["next_cursor"])
+
+        page2 = self.service.read(
+            self.team,
+            agent="dev",
+            unread_only=False,
+            limit=2,
+            cursor=page1["next_cursor"],
+        )
+        self.assertEqual(["msg_page_2", "msg_page_3"], [m["id"] for m in page2["messages"]])
+        self.assertEqual("msg_page_2", page2["next_cursor"])
+
+        page3 = self.service.read(
+            self.team,
+            agent="dev",
+            unread_only=False,
+            limit=2,
+            cursor=page2["next_cursor"],
+        )
+        self.assertEqual(["msg_page_1"], [m["id"] for m in page3["messages"]])
+        self.assertIsNone(page3["next_cursor"])
+
+    def test_trace_cursor_pagination(self) -> None:
+        for i in range(1, 6):
+            self.service.send(
+                self.team,
+                {
+                    "id": f"msg_trace_page_{i}",
+                    "type": "handoff",
+                    "from": "lead",
+                    "to": "qa",
+                    "trace_id": "trace_paginated",
+                    "payload": {"seq": i},
+                },
+            )
+
+        page1 = self.service.trace(self.team, trace_id="trace_paginated", limit=2)
+        self.assertEqual(2, page1["count"])
+        self.assertIsNotNone(page1["next_cursor"])
+
+        page2 = self.service.trace(
+            self.team,
+            trace_id="trace_paginated",
+            limit=2,
+            cursor=page1["next_cursor"],
+        )
+        self.assertEqual(2, page2["count"])
+        self.assertIsNotNone(page2["next_cursor"])
+
+        page3 = self.service.trace(
+            self.team,
+            trace_id="trace_paginated",
+            limit=2,
+            cursor=page2["next_cursor"],
+        )
+        self.assertGreaterEqual(page3["count"], 1)
+        self.assertIsNone(page3["next_cursor"])
+
+    def test_trace_cursor_pagination_no_duplicates_against_full_trace(self) -> None:
+        for i in range(30):
+            self.service.send(
+                self.team,
+                {
+                    "id": f"msg_trace_reg_{i}",
+                    "type": "handoff",
+                    "from": "lead",
+                    "to": "dev",
+                    "trace_id": "trace_regression",
+                    "payload": {"seq": i},
+                },
+            )
+
+        full = self.service.trace(self.team, trace_id="trace_regression", limit=0)
+        full_ids = [event["id"] for event in full["events"]]
+
+        paged_ids: list[str] = []
+        cursor = None
+        while True:
+            page = self.service.trace(
+                self.team,
+                trace_id="trace_regression",
+                limit=7,
+                cursor=cursor,
+            )
+            paged_ids.extend([event["id"] for event in page["events"]])
+            cursor = page.get("next_cursor")
+            if not cursor:
+                break
+
+        self.assertEqual(len(full_ids), len(paged_ids))
+        self.assertEqual(len(set(full_ids)), len(set(paged_ids)))
+        self.assertEqual(set(full_ids), set(paged_ids))
+
+    def test_ack_fallback_works_without_index_offset(self) -> None:
+        self.service.send(
+            self.team,
+            {
+                "id": "msg_no_offset",
+                "type": "task_assign",
+                "from": "lead",
+                "to": "dev",
+                "payload": {"subject": "compat"},
+            },
+        )
+        store = self.service.store(self.team)
+        index = store.read_json(store.message_index_path, {})
+        entry = index.get("msg_no_offset", {})
+        if isinstance(entry, dict) and "offset" in entry:
+            del entry["offset"]
+        index["msg_no_offset"] = entry
+        store.write_json_atomic(store.message_index_path, index)
+
+        ack = self.service.ack(self.team, agent="dev", message_id="msg_no_offset")
+        self.assertEqual("acked", ack["status"])
+
     def test_rejects_team_path_traversal(self) -> None:
         with self.assertRaises(ValueError):
             self.service.init_team("../escape", members=["lead"])

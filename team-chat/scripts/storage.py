@@ -86,6 +86,23 @@ class TeamStore:
         with path.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
 
+    def _read_jsonl_record_at_offset(self, path: Path, offset: int) -> dict[str, Any] | None:
+        if offset < 0 or not path.exists():
+            return None
+        try:
+            with path.open("rb") as handle:
+                handle.seek(offset)
+                raw = handle.readline()
+        except Exception:
+            return None
+        if not raw:
+            return None
+        try:
+            payload = json.loads(raw.decode("utf-8").strip())
+        except Exception:
+            return None
+        return payload if isinstance(payload, dict) else None
+
     def read_jsonl(self, path: Path) -> list[dict[str, Any]]:
         if not path.exists():
             return []
@@ -142,11 +159,16 @@ class TeamStore:
             if message_id in index:
                 return False
 
-            self.append_jsonl(inbox_path, message)
+            inbox_path.parent.mkdir(parents=True, exist_ok=True)
+            line = (json.dumps(message, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+            with inbox_path.open("ab") as handle:
+                offset = int(handle.tell())
+                handle.write(line)
             index[message_id] = {
                 "inbox": inbox_path.name,
                 "created_at": message.get("created_at"),
                 "to": agent,
+                "offset": offset,
             }
             self.write_json_atomic(self.message_index_path, index)
             return True
@@ -160,7 +182,15 @@ class TeamStore:
         inbox_name = info.get("inbox")
         if not isinstance(inbox_name, str):
             return None
-        records = self.read_jsonl(self.inboxes_dir / inbox_name)
+
+        inbox_path = self.inboxes_dir / inbox_name
+        offset = info.get("offset")
+        if isinstance(offset, int):
+            record = self._read_jsonl_record_at_offset(inbox_path, offset)
+            if record and record.get("id") == message_id:
+                return record
+
+        records = self.read_jsonl(inbox_path)
         for record in records:
             if record.get("id") == message_id:
                 return record
@@ -181,6 +211,100 @@ class TeamStore:
         if limit > 0:
             messages = messages[-limit:]
         return messages
+
+    def _iter_jsonl_reverse(self, path: Path, *, chunk_size: int = 64 * 1024) -> Iterator[dict[str, Any]]:
+        if not path.exists():
+            return
+
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            position = handle.tell()
+            buffer = b""
+
+            while position > 0:
+                read_size = min(chunk_size, position)
+                position -= read_size
+                handle.seek(position)
+                chunk = handle.read(read_size)
+                buffer = chunk + buffer
+                lines = buffer.split(b"\n")
+                buffer = lines[0]
+                for raw in reversed(lines[1:]):
+                    stripped = raw.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        payload = json.loads(stripped.decode("utf-8"))
+                    except Exception:
+                        continue
+                    if isinstance(payload, dict):
+                        yield payload
+
+            stripped = buffer.strip()
+            if stripped:
+                try:
+                    payload = json.loads(stripped.decode("utf-8"))
+                except Exception:
+                    payload = None
+                if isinstance(payload, dict):
+                    yield payload
+
+    def list_messages_window_for_agent(
+        self,
+        agent: str,
+        *,
+        unread_only: bool = False,
+        limit: int = 100,
+        cursor: str | None = None,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        safe_agent = validate_identifier(agent, field_name="agent")
+        inbox_path = self._inbox_path(safe_agent)
+        clamped_limit = max(0, int(limit))
+        ack_ids: set[str] = set()
+        if unread_only:
+            ack_index = self.read_json(self.ack_index_path, {})
+            ack_ids = {str(message_id) for message_id in ack_index.keys()}
+
+        started = cursor is None
+        cursor_found = cursor is None
+        collected: list[dict[str, Any]] = []
+        target = clamped_limit + 1 if clamped_limit > 0 else None
+
+        for message in self._iter_jsonl_reverse(inbox_path):
+            message_id = message.get("id")
+            if not isinstance(message_id, str):
+                continue
+
+            if not started:
+                if message_id == cursor:
+                    started = True
+                    cursor_found = True
+                continue
+
+            if unread_only and message_id in ack_ids:
+                continue
+
+            collected.append(message)
+            if target is not None and len(collected) >= target:
+                break
+
+        if cursor is not None and not cursor_found:
+            return [], None
+
+        if clamped_limit <= 0:
+            page_reverse = collected
+            has_more = False
+        else:
+            page_reverse = collected[:clamped_limit]
+            has_more = len(collected) > clamped_limit
+
+        page = list(reversed(page_reverse))
+        next_cursor = None
+        if has_more and page:
+            oldest = page[0].get("id")
+            if isinstance(oldest, str):
+                next_cursor = oldest
+        return page, next_cursor
 
     def record_ack(self, message_id: str, *, agent: str, acked_at: str, delivery_id: str | None = None) -> bool:
         with self.lock("acks"):
@@ -226,6 +350,11 @@ class TeamStore:
             events.extend(self.read_jsonl(path))
         events.sort(key=lambda item: (item.get("created_at", ""), item.get("id", "")))
         return events
+
+    def iter_events_reverse(self) -> Iterator[dict[str, Any]]:
+        for path in sorted(self.events_dir.glob("*.jsonl"), reverse=True):
+            for event in self._iter_jsonl_reverse(path):
+                yield event
 
     def write_dead_letter(self, entry: dict[str, Any]) -> None:
         created_at = str(entry.get("created_at", ""))
