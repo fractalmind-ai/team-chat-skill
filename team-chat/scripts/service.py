@@ -194,12 +194,18 @@ class TeamChatService:
         agent: str,
         unread_only: bool,
         limit: int,
+        cursor: str | None = None,
     ) -> dict[str, Any]:
         store = self.store(team)
         store.ensure_layout()
 
         safe_agent = validate_identifier(agent, field_name="agent")
-        messages = store.list_messages_for_agent(safe_agent, unread_only=unread_only, limit=limit)
+        messages, next_cursor = store.list_messages_window_for_agent(
+            safe_agent,
+            unread_only=unread_only,
+            limit=limit,
+            cursor=cursor,
+        )
         read_event = new_event(
             kind="inbox_read",
             team=team,
@@ -207,11 +213,19 @@ class TeamChatService:
                 "agent": safe_agent,
                 "count": len(messages),
                 "unread_only": unread_only,
+                "cursor": cursor,
+                "next_cursor": next_cursor,
             },
         )
         store.append_event(read_event)
 
-        return {"team": team, "agent": safe_agent, "messages": messages, "count": len(messages)}
+        return {
+            "team": team,
+            "agent": safe_agent,
+            "messages": messages,
+            "count": len(messages),
+            "next_cursor": next_cursor,
+        }
 
     def ack(self, team: str, *, agent: str, message_id: str) -> dict[str, Any]:
         store = self.store(team)
@@ -304,19 +318,78 @@ class TeamChatService:
             "task_count": len(snapshots),
         }
 
-    def trace(self, team: str, *, trace_id: str) -> dict[str, Any]:
+    def trace(
+        self,
+        team: str,
+        *,
+        trace_id: str,
+        limit: int = 0,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
         store = self.store(team)
-        events = store.iter_events()
+        clamped_limit = max(0, int(limit))
 
-        matched = [
-            event
-            for event in events
-            if event.get("trace_id") == trace_id
-            or event.get("payload", {}).get("trace_id") == trace_id
-            or event.get("payload", {}).get("message", {}).get("trace_id") == trace_id
-        ]
-        matched.sort(key=sort_key_by_created_at)
-        return {"team": team, "trace_id": trace_id, "events": matched, "count": len(matched)}
+        if clamped_limit <= 0:
+            events = store.iter_events()
+            matched = [event for event in events if self._event_matches_trace(event, trace_id)]
+            matched.sort(key=sort_key_by_created_at)
+            return {
+                "team": team,
+                "trace_id": trace_id,
+                "events": matched,
+                "count": len(matched),
+                "next_cursor": None,
+            }
+
+        started = cursor is None
+        cursor_found = cursor is None
+        collected: list[dict[str, Any]] = []
+        target = clamped_limit + 1
+
+        for event in store.iter_events_reverse():
+            event_id = event.get("id")
+            if not isinstance(event_id, str):
+                continue
+
+            if not started:
+                if event_id == cursor:
+                    started = True
+                    cursor_found = True
+                continue
+
+            if not self._event_matches_trace(event, trace_id):
+                continue
+
+            collected.append(event)
+            if len(collected) >= target:
+                break
+
+        if cursor is not None and not cursor_found:
+            return {
+                "team": team,
+                "trace_id": trace_id,
+                "events": [],
+                "count": 0,
+                "next_cursor": None,
+            }
+
+        page_reverse = collected[:clamped_limit]
+        has_more = len(collected) > clamped_limit
+        page = list(reversed(page_reverse))
+        page.sort(key=sort_key_by_created_at)
+
+        next_cursor = None
+        if has_more and page:
+            oldest_id = page[0].get("id")
+            if isinstance(oldest_id, str):
+                next_cursor = oldest_id
+        return {
+            "team": team,
+            "trace_id": trace_id,
+            "events": page,
+            "count": len(page),
+            "next_cursor": next_cursor,
+        }
 
     def rehydrate(self, team: str) -> dict[str, Any]:
         store = self.store(team)
@@ -443,6 +516,13 @@ class TeamChatService:
             snapshot["last_update_from"] = message.get("from")
 
         snapshots[task_id] = snapshot
+
+    def _event_matches_trace(self, event: dict[str, Any], trace_id: str) -> bool:
+        return (
+            event.get("trace_id") == trace_id
+            or event.get("payload", {}).get("trace_id") == trace_id
+            or event.get("payload", {}).get("message", {}).get("trace_id") == trace_id
+        )
 
 
 def iso_to_local_string(value: str) -> str:

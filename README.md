@@ -22,7 +22,16 @@ $CLI read demo --agent dev --unread
 $CLI ack demo --agent dev --message-id <MESSAGE_ID>
 $CLI status demo
 $CLI trace demo --trace-id tr_1
+$CLI read demo --agent dev --unread --limit 50 --json
+# use returned next_cursor for older page
+$CLI read demo --agent dev --unread --limit 50 --cursor <NEXT_CURSOR> --json
 ```
+
+## Pagination / Cursor
+
+- `read` supports `--limit` + `--cursor` (message id cursor, reads older messages).
+- `trace` supports `--limit` + `--cursor` (event id cursor, reads older events).
+- JSON output includes `next_cursor` when older records remain.
 
 ## Tests
 
