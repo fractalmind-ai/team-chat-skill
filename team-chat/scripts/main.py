@@ -20,7 +20,10 @@ def _parse_payload(args: argparse.Namespace) -> dict:
         return json.loads(args.payload_json)
     if args.payload_file:
         path = Path(args.payload_file)
-        return json.loads(path.read_text(encoding="utf-8"))
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError as exc:
+            raise ValueError(f"payload file not found: {path}") from exc
     return {}
 
 
