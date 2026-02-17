@@ -335,6 +335,45 @@ class TeamChatServiceTests(unittest.TestCase):
                 },
             )
 
+    def test_rejects_task_id_path_traversal(self) -> None:
+        with self.assertRaises(ValueError):
+            self.service.send(
+                self.team,
+                {
+                    "id": "msg_bad_task_id",
+                    "type": "task_assign",
+                    "from": "lead",
+                    "to": "dev",
+                    "task_id": "../../escape",
+                    "payload": {"subject": "bad"},
+                },
+            )
+
+    def test_rehydrate_ignores_malformed_task_id_snapshot_update(self) -> None:
+        store = self.service.store(self.team)
+        inbox = store.inboxes_dir / "dev.jsonl"
+        store.append_jsonl(
+            inbox,
+            {
+                "id": "msg_malformed_task_id",
+                "type": "task_assign",
+                "from": "lead",
+                "to": "dev",
+                "task_id": "../../escape",
+                "payload": {"subject": "malformed"},
+                "created_at": "2026-02-16T00:00:00Z",
+                "schema_version": 1,
+                "priority": "normal",
+            },
+        )
+
+        self.service.rehydrate(self.team)
+
+        escaped = self.root / "teams" / "escape.json"
+        self.assertFalse(escaped.exists())
+        tasks = list((self.root / "teams" / self.team / "tasks").glob("*.json"))
+        self.assertEqual([], tasks)
+
 
 if __name__ == "__main__":
     unittest.main()

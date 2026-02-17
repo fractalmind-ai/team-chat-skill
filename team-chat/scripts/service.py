@@ -478,6 +478,11 @@ class TeamChatService:
         task_id = message.get("task_id")
         if not isinstance(task_id, str) or not task_id:
             return
+        try:
+            task_id = validate_identifier(task_id, field_name="task_id")
+        except ValueError:
+            # Keep rehydrate resilient to malformed historical data.
+            return
 
         payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
         created_at = message.get("created_at") or utc_now_iso()
