@@ -185,6 +185,18 @@ def cmd_status(args: argparse.Namespace) -> int:
             f"- {msg.get('id')} to={msg.get('to')} type={msg.get('type')} "
             f"created={iso_to_local_string(msg.get('created_at', ''))} age_min={age}"
         )
+
+    diagnostics = result.get("malformed_jsonl", {})
+    malformed_total = int(diagnostics.get("total", 0)) if isinstance(diagnostics, dict) else 0
+    print(f"malformed_jsonl_total: {malformed_total}")
+    if isinstance(diagnostics, dict):
+        for item in diagnostics.get("files", []):
+            if not isinstance(item, dict):
+                continue
+            print(
+                f"- {item.get('path')}: count={item.get('count', 0)} "
+                f"last_line={item.get('last_line')} last_reason={item.get('last_reason')}"
+            )
     return 0
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from contextlib import contextmanager
 from copy import deepcopy
@@ -42,6 +43,7 @@ class TeamStore:
         self.event_index_path = self.state_dir / "event-index.json"
         self.ack_index_path = self.state_dir / "ack-index.json"
         self.nudge_index_path = self.state_dir / "nudge-index.json"
+        self.malformed_jsonl_path = self.state_dir / "malformed-jsonl.json"
         self.message_index_shards_dir = self.state_dir / "message-index-shards"
         self.event_index_shards_dir = self.state_dir / "event-index-shards"
 
@@ -62,6 +64,117 @@ class TeamStore:
     def _index_shard_path(self, shard_dir: Path, key: str) -> Path:
         digest = sha1(key.encode("utf-8")).hexdigest()[:2]
         return shard_dir / f"{digest}.json"
+
+    def _to_relative_path(self, path: Path) -> str:
+        try:
+            return str(path.relative_to(self.base_dir))
+        except ValueError:
+            return str(path)
+
+    def _warn_malformed_enabled(self) -> bool:
+        return str(os.getenv("TEAM_CHAT_WARN_MALFORMED", "")).lower() in {"1", "true", "yes", "on"}
+
+    def _record_malformed_jsonl(
+        self,
+        *,
+        path: Path,
+        raw_line: str,
+        reason: str,
+        line_number: int | None = None,
+    ) -> None:
+        relative_path = self._to_relative_path(path)
+        raw_hash = sha1(raw_line.encode("utf-8", errors="replace")).hexdigest()
+        fingerprint = f"{line_number}:{raw_hash}" if line_number is not None else raw_hash
+        now = int(time.time())
+        sample = raw_line.strip()
+        if len(sample) > 120:
+            sample = sample[:117] + "..."
+
+        is_new = False
+        with self.lock("malformed-jsonl"):
+            state = self.read_json(self.malformed_jsonl_path, {"total": 0, "by_file": {}})
+            if not isinstance(state, dict):
+                state = {"total": 0, "by_file": {}}
+            by_file = state.get("by_file")
+            if not isinstance(by_file, dict):
+                by_file = {}
+
+            file_entry = by_file.get(relative_path)
+            if not isinstance(file_entry, dict):
+                file_entry = {"count": 0, "items": {}}
+
+            items = file_entry.get("items")
+            if not isinstance(items, dict):
+                items = {}
+
+            if fingerprint not in items:
+                is_new = True
+                items[fingerprint] = {
+                    "line": line_number,
+                    "reason": reason,
+                    "sample": sample,
+                    "first_seen_ts": now,
+                    "last_seen_ts": now,
+                }
+            else:
+                existing = items.get(fingerprint)
+                if not isinstance(existing, dict):
+                    existing = {}
+                existing["line"] = line_number
+                existing["reason"] = reason
+                existing["sample"] = sample
+                existing["last_seen_ts"] = now
+                existing.setdefault("first_seen_ts", now)
+                items[fingerprint] = existing
+
+            file_entry["items"] = items
+            file_entry["count"] = len(items)
+            file_entry["last_seen_ts"] = now
+            file_entry["last_line"] = line_number
+            file_entry["last_reason"] = reason
+            by_file[relative_path] = file_entry
+
+            total = 0
+            for entry in by_file.values():
+                if isinstance(entry, dict):
+                    total += int(entry.get("count", 0))
+            state["total"] = total
+            state["by_file"] = by_file
+            self.write_json_atomic(self.malformed_jsonl_path, state)
+
+        if is_new and self._warn_malformed_enabled():
+            location = f"{relative_path}:{line_number}" if line_number is not None else relative_path
+            print(
+                f"warning: malformed jsonl skipped at {location} ({reason})",
+                file=sys.stderr,
+            )
+
+    def malformed_jsonl_diagnostics(self) -> dict[str, Any]:
+        state = self.read_json(self.malformed_jsonl_path, {"total": 0, "by_file": {}})
+        if not isinstance(state, dict):
+            return {"total": 0, "files": []}
+        by_file = state.get("by_file")
+        if not isinstance(by_file, dict):
+            by_file = {}
+
+        files: list[dict[str, Any]] = []
+        total = 0
+        for path, entry in by_file.items():
+            if not isinstance(path, str) or not isinstance(entry, dict):
+                continue
+            count = int(entry.get("count", 0))
+            total += count
+            files.append(
+                {
+                    "path": path,
+                    "count": count,
+                    "last_line": entry.get("last_line"),
+                    "last_reason": entry.get("last_reason"),
+                    "last_seen_ts": entry.get("last_seen_ts"),
+                }
+            )
+        files.sort(key=lambda item: (item.get("path", "")))
+        return {"total": total, "files": files}
 
     def _index_migration_marker(self, shard_dir: Path) -> Path:
         return shard_dir / ".migrated"
@@ -179,24 +292,51 @@ class TeamStore:
             return None
         try:
             payload = json.loads(raw.decode("utf-8").strip())
-        except Exception:
+        except Exception as exc:
+            self._record_malformed_jsonl(
+                path=path,
+                raw_line=raw.decode("utf-8", errors="replace"),
+                reason=str(exc),
+                line_number=None,
+            )
             return None
-        return payload if isinstance(payload, dict) else None
+        if not isinstance(payload, dict):
+            self._record_malformed_jsonl(
+                path=path,
+                raw_line=raw.decode("utf-8", errors="replace"),
+                reason="jsonl record is not an object",
+                line_number=None,
+            )
+            return None
+        return payload
 
     def read_jsonl(self, path: Path) -> list[dict[str, Any]]:
         if not path.exists():
             return []
         records: list[dict[str, Any]] = []
-        for raw in path.read_text(encoding="utf-8").splitlines():
+        for line_number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
             stripped = raw.strip()
             if not stripped:
                 continue
             try:
                 payload = json.loads(stripped)
-            except Exception:
+            except Exception as exc:
+                self._record_malformed_jsonl(
+                    path=path,
+                    raw_line=raw,
+                    reason=str(exc),
+                    line_number=line_number,
+                )
                 continue
             if isinstance(payload, dict):
                 records.append(payload)
+                continue
+            self._record_malformed_jsonl(
+                path=path,
+                raw_line=raw,
+                reason="jsonl record is not an object",
+                line_number=line_number,
+            )
         return records
 
     def load_ack_policy(self) -> dict[str, dict[str, int]]:
@@ -325,19 +465,45 @@ class TeamStore:
                         continue
                     try:
                         payload = json.loads(stripped.decode("utf-8"))
-                    except Exception:
+                    except Exception as exc:
+                        self._record_malformed_jsonl(
+                            path=path,
+                            raw_line=stripped.decode("utf-8", errors="replace"),
+                            reason=str(exc),
+                            line_number=None,
+                        )
                         continue
                     if isinstance(payload, dict):
                         yield payload
+                        continue
+                    self._record_malformed_jsonl(
+                        path=path,
+                        raw_line=stripped.decode("utf-8", errors="replace"),
+                        reason="jsonl record is not an object",
+                        line_number=None,
+                    )
 
             stripped = buffer.strip()
             if stripped:
                 try:
                     payload = json.loads(stripped.decode("utf-8"))
-                except Exception:
+                except Exception as exc:
+                    self._record_malformed_jsonl(
+                        path=path,
+                        raw_line=stripped.decode("utf-8", errors="replace"),
+                        reason=str(exc),
+                        line_number=None,
+                    )
                     payload = None
                 if isinstance(payload, dict):
                     yield payload
+                elif payload is not None:
+                    self._record_malformed_jsonl(
+                        path=path,
+                        raw_line=stripped.decode("utf-8", errors="replace"),
+                        reason="jsonl record is not an object",
+                        line_number=None,
+                    )
 
     def list_messages_window_for_agent(
         self,

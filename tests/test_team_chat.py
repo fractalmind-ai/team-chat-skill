@@ -356,6 +356,29 @@ class TeamChatServiceTests(unittest.TestCase):
         self.assertFalse(store.message_index_path.exists())
         self.assertFalse(store.event_index_path.exists())
 
+    def test_malformed_jsonl_diagnostics_are_counted_and_deduplicated(self) -> None:
+        store = self.service.store(self.team)
+        inbox = store.inboxes_dir / "dev.jsonl"
+        inbox.write_text('{"id":"ok"}\n{"id":"broken"\n42\n', encoding="utf-8")
+
+        records = store.read_jsonl(inbox)
+        self.assertEqual(1, len(records))
+
+        diag = store.malformed_jsonl_diagnostics()
+        self.assertEqual(2, diag["total"])
+        by_path = {entry["path"]: entry for entry in diag["files"]}
+        inbox_rel = f"teams/{self.team}/inboxes/dev.jsonl"
+        self.assertEqual(2, by_path[inbox_rel]["count"])
+
+        # Re-reading the same malformed lines should not inflate counters.
+        store.read_jsonl(inbox)
+        diag_after = store.malformed_jsonl_diagnostics()
+        self.assertEqual(2, diag_after["total"])
+
+        status = self.service.status(self.team, stale_minutes=90)
+        self.assertIn("malformed_jsonl", status)
+        self.assertEqual(2, status["malformed_jsonl"]["total"])
+
     def test_rejects_team_path_traversal(self) -> None:
         with self.assertRaises(ValueError):
             self.service.init_team("../escape", members=["lead"])
