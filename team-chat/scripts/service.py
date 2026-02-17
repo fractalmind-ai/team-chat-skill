@@ -313,6 +313,7 @@ class TeamChatService:
                 stale_tasks.append(task)
 
         stale_messages = store.stale_unread_messages(stale_seconds)
+        malformed_jsonl = store.malformed_jsonl_diagnostics()
 
         return {
             "team": team,
@@ -321,6 +322,7 @@ class TeamChatService:
             "blocked_tasks": blocked_tasks,
             "stale_tasks": stale_tasks,
             "stale_messages": stale_messages,
+            "malformed_jsonl": malformed_jsonl,
             "task_count": len(snapshots),
         }
 
