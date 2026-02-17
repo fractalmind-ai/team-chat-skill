@@ -7,6 +7,7 @@ import os
 import time
 from contextlib import contextmanager
 from copy import deepcopy
+from hashlib import sha1
 from pathlib import Path
 from typing import Any, Iterator
 from uuid import uuid4
@@ -41,6 +42,8 @@ class TeamStore:
         self.event_index_path = self.state_dir / "event-index.json"
         self.ack_index_path = self.state_dir / "ack-index.json"
         self.nudge_index_path = self.state_dir / "nudge-index.json"
+        self.message_index_shards_dir = self.state_dir / "message-index-shards"
+        self.event_index_shards_dir = self.state_dir / "event-index-shards"
 
     def ensure_layout(self) -> None:
         for directory in (
@@ -51,8 +54,85 @@ class TeamStore:
             self.state_dir,
             self.dead_letter_dir,
             self.locks_dir,
+            self.message_index_shards_dir,
+            self.event_index_shards_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
+
+    def _index_shard_path(self, shard_dir: Path, key: str) -> Path:
+        digest = sha1(key.encode("utf-8")).hexdigest()[:2]
+        return shard_dir / f"{digest}.json"
+
+    def _index_migration_marker(self, shard_dir: Path) -> Path:
+        return shard_dir / ".migrated"
+
+    def _mark_index_migrated(self, shard_dir: Path) -> None:
+        marker = self._index_migration_marker(shard_dir)
+        marker.write_text("1\n", encoding="utf-8")
+
+    def _load_index_entry(
+        self,
+        *,
+        legacy_path: Path,
+        shard_dir: Path,
+        item_id: str,
+    ) -> dict[str, Any] | None:
+        shard_path = self._index_shard_path(shard_dir, item_id)
+        shard_index = self.read_json(shard_path, {})
+        if isinstance(shard_index, dict):
+            entry = shard_index.get(item_id)
+            if isinstance(entry, dict):
+                return entry
+
+        if self._index_migration_marker(shard_dir).exists():
+            return None
+
+        legacy_index = self.read_json(legacy_path, {})
+        if not isinstance(legacy_index, dict):
+            return None
+        entry = legacy_index.get(item_id)
+        return entry if isinstance(entry, dict) else None
+
+    def _ensure_index_migrated_locked(self, *, legacy_path: Path, shard_dir: Path) -> None:
+        marker = self._index_migration_marker(shard_dir)
+        if marker.exists():
+            return
+
+        legacy_index = self.read_json(legacy_path, {})
+        if isinstance(legacy_index, dict) and legacy_index:
+            shard_buckets: dict[Path, dict[str, Any]] = {}
+            for key, payload in legacy_index.items():
+                if not isinstance(key, str) or not isinstance(payload, dict):
+                    continue
+                shard_path = self._index_shard_path(shard_dir, key)
+                bucket = shard_buckets.setdefault(shard_path, {})
+                bucket[key] = payload
+            for shard_path, bucket in shard_buckets.items():
+                existing = self.read_json(shard_path, {})
+                if isinstance(existing, dict) and existing:
+                    merged = dict(existing)
+                    merged.update(bucket)
+                    bucket = merged
+                self.write_json_atomic(shard_path, bucket)
+
+        self._mark_index_migrated(shard_dir)
+
+    def _replace_index_shards_locked(self, *, shard_dir: Path, index: dict[str, Any]) -> None:
+        for existing in shard_dir.glob("*.json"):
+            existing.unlink()
+
+        shard_buckets: dict[Path, dict[str, Any]] = {}
+        for key, payload in index.items():
+            if not isinstance(key, str) or not isinstance(payload, dict):
+                continue
+            shard_path = self._index_shard_path(shard_dir, key)
+            bucket = shard_buckets.setdefault(shard_path, {})
+            bucket[key] = payload
+
+        for shard_path, bucket in shard_buckets.items():
+            self.write_json_atomic(shard_path, bucket)
+
+        self._mark_index_migrated(shard_dir)
 
     @contextmanager
     def lock(self, lock_name: str) -> Iterator[None]:
@@ -155,7 +235,14 @@ class TeamStore:
         inbox_path = self._inbox_path(agent)
 
         with self.lock("messages"):
-            index = self.read_json(self.message_index_path, {})
+            self._ensure_index_migrated_locked(
+                legacy_path=self.message_index_path,
+                shard_dir=self.message_index_shards_dir,
+            )
+            shard_path = self._index_shard_path(self.message_index_shards_dir, message_id)
+            index = self.read_json(shard_path, {})
+            if not isinstance(index, dict):
+                index = {}
             if message_id in index:
                 return False
 
@@ -170,13 +257,16 @@ class TeamStore:
                 "to": agent,
                 "offset": offset,
             }
-            self.write_json_atomic(self.message_index_path, index)
+            self.write_json_atomic(shard_path, index)
             return True
 
     def get_message(self, message_id: str) -> dict[str, Any] | None:
-        index = self.read_json(self.message_index_path, {})
-        info = index.get(message_id)
-        if not isinstance(info, dict):
+        info = self._load_index_entry(
+            legacy_path=self.message_index_path,
+            shard_dir=self.message_index_shards_dir,
+            item_id=message_id,
+        )
+        if not info:
             return None
 
         inbox_name = info.get("inbox")
@@ -335,13 +425,20 @@ class TeamStore:
         event_path = self.events_dir / f"{date_part}.jsonl"
 
         with self.lock("events"):
-            index = self.read_json(self.event_index_path, {})
+            self._ensure_index_migrated_locked(
+                legacy_path=self.event_index_path,
+                shard_dir=self.event_index_shards_dir,
+            )
+            shard_path = self._index_shard_path(self.event_index_shards_dir, event_id)
+            index = self.read_json(shard_path, {})
+            if not isinstance(index, dict):
+                index = {}
             if event_id in index:
                 return False
 
             self.append_jsonl(event_path, event)
             index[event_id] = {"file": event_path.name, "created_at": created_at}
-            self.write_json_atomic(self.event_index_path, index)
+            self.write_json_atomic(shard_path, index)
             return True
 
     def iter_events(self) -> list[dict[str, Any]]:
@@ -440,6 +537,14 @@ class TeamStore:
             self.write_json_atomic(self.message_index_path, message_index)
             self.write_json_atomic(self.event_index_path, event_index)
             self.write_json_atomic(self.ack_index_path, ack_index)
+            self._replace_index_shards_locked(
+                shard_dir=self.message_index_shards_dir,
+                index=message_index,
+            )
+            self._replace_index_shards_locked(
+                shard_dir=self.event_index_shards_dir,
+                index=event_index,
+            )
 
     def replace_task_snapshots(self, snapshots: dict[str, dict[str, Any]]) -> None:
         self.ensure_layout()

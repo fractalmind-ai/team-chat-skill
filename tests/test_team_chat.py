@@ -293,15 +293,68 @@ class TeamChatServiceTests(unittest.TestCase):
             },
         )
         store = self.service.store(self.team)
-        index = store.read_json(store.message_index_path, {})
+        shard_path = store._index_shard_path(store.message_index_shards_dir, "msg_no_offset")
+        index = store.read_json(shard_path, {})
         entry = index.get("msg_no_offset", {})
         if isinstance(entry, dict) and "offset" in entry:
             del entry["offset"]
         index["msg_no_offset"] = entry
-        store.write_json_atomic(store.message_index_path, index)
+        store.write_json_atomic(shard_path, index)
 
         ack = self.service.ack(self.team, agent="dev", message_id="msg_no_offset")
         self.assertEqual("acked", ack["status"])
+
+    def test_get_message_falls_back_to_legacy_index_before_migration(self) -> None:
+        store = self.service.store(self.team)
+        inbox = store.inboxes_dir / "dev.jsonl"
+        message = {
+            "id": "msg_legacy_index",
+            "type": "task_assign",
+            "from": "lead",
+            "to": "dev",
+            "payload": {"subject": "legacy"},
+            "created_at": "2026-02-17T00:00:00Z",
+            "schema_version": 1,
+            "priority": "normal",
+        }
+        store.append_jsonl(inbox, message)
+        store.write_json_atomic(
+            store.message_index_path,
+            {
+                "msg_legacy_index": {
+                    "inbox": "dev.jsonl",
+                    "created_at": message["created_at"],
+                    "to": "dev",
+                }
+            },
+        )
+
+        loaded = store.get_message("msg_legacy_index")
+        self.assertIsNotNone(loaded)
+        self.assertEqual("msg_legacy_index", loaded["id"])
+
+    def test_send_writes_sharded_indexes_on_hot_path(self) -> None:
+        for i in range(60):
+            self.service.send(
+                self.team,
+                {
+                    "id": f"msg_hot_{i}",
+                    "type": "task_update",
+                    "from": "lead",
+                    "to": "dev",
+                    "task_id": f"task_{i % 5}",
+                    "payload": {"status": "working", "i": i},
+                },
+            )
+
+        store = self.service.store(self.team)
+        msg_shards = list(store.message_index_shards_dir.glob("*.json"))
+        event_shards = list(store.event_index_shards_dir.glob("*.json"))
+
+        self.assertGreater(len(msg_shards), 1)
+        self.assertGreater(len(event_shards), 1)
+        self.assertFalse(store.message_index_path.exists())
+        self.assertFalse(store.event_index_path.exists())
 
     def test_rejects_team_path_traversal(self) -> None:
         with self.assertRaises(ValueError):

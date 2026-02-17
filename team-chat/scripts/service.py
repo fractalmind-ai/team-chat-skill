@@ -26,9 +26,15 @@ def _dlq_id() -> str:
 class TeamChatService:
     def __init__(self, repo_root: Path):
         self.repo_root = Path(repo_root)
+        self._stores: dict[str, TeamStore] = {}
 
     def store(self, team: str) -> TeamStore:
-        return TeamStore(self.repo_root, team)
+        safe_team = validate_identifier(team, field_name="team")
+        store = self._stores.get(safe_team)
+        if store is None:
+            store = TeamStore(self.repo_root, safe_team)
+            self._stores[safe_team] = store
+        return store
 
     def init_team(self, team: str, members: list[str] | None = None) -> dict[str, Any]:
         store = self.store(team)
