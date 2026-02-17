@@ -371,11 +371,13 @@ class TeamStore:
         return records
 
     def write_task_snapshot(self, task_id: str, payload: dict[str, Any]) -> None:
-        path = self.tasks_dir / f"{task_id}.json"
+        safe_task_id = validate_identifier(task_id, field_name="task_id")
+        path = self.tasks_dir / f"{safe_task_id}.json"
         self.write_json_atomic(path, payload)
 
     def read_task_snapshot(self, task_id: str) -> dict[str, Any] | None:
-        path = self.tasks_dir / f"{task_id}.json"
+        safe_task_id = validate_identifier(task_id, field_name="task_id")
+        path = self.tasks_dir / f"{safe_task_id}.json"
         if not path.exists():
             return None
         snapshot = self.read_json(path, None)

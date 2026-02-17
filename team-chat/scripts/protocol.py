@@ -96,6 +96,13 @@ def validate_message(message: dict[str, Any]) -> None:
             field_name=f"message.{endpoint}",
         )
 
+    task_id = message.get("task_id")
+    if task_id is not None:
+        message["task_id"] = validate_identifier(
+            task_id,
+            field_name="message.task_id",
+        )
+
     if not isinstance(message.get("payload"), dict):
         raise ValueError("message.payload must be an object")
 
