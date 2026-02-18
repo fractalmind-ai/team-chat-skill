@@ -230,6 +230,34 @@ class TeamStore:
 
         self._mark_index_migrated(shard_dir)
 
+    def _iter_message_index_entries(self) -> Iterator[tuple[str, dict[str, Any]]]:
+        marker = self._index_migration_marker(self.message_index_shards_dir)
+        if marker.exists():
+            for shard in sorted(self.message_index_shards_dir.glob("*.json")):
+                index = self.read_json(shard, {})
+                if not isinstance(index, dict):
+                    continue
+                for message_id, info in index.items():
+                    if isinstance(message_id, str) and isinstance(info, dict):
+                        yield message_id, info
+            return
+
+        legacy = self.read_json(self.message_index_path, {})
+        if isinstance(legacy, dict) and legacy:
+            for message_id, info in legacy.items():
+                if isinstance(message_id, str) and isinstance(info, dict):
+                    yield message_id, info
+            return
+
+        # Fallback for partially migrated state where marker is absent but shards exist.
+        for shard in sorted(self.message_index_shards_dir.glob("*.json")):
+            index = self.read_json(shard, {})
+            if not isinstance(index, dict):
+                continue
+            for message_id, info in index.items():
+                if isinstance(message_id, str) and isinstance(info, dict):
+                    yield message_id, info
+
     def _replace_index_shards_locked(self, *, shard_dir: Path, index: dict[str, Any]) -> None:
         for existing in shard_dir.glob("*.json"):
             existing.unlink()
@@ -395,6 +423,7 @@ class TeamStore:
                 "inbox": inbox_path.name,
                 "created_at": message.get("created_at"),
                 "to": agent,
+                "type": message.get("type"),
                 "offset": offset,
             }
             self.write_json_atomic(shard_path, index)
@@ -691,6 +720,75 @@ class TeamStore:
                     stale.append(message)
         stale.sort(key=lambda item: (item.get("created_at", ""), item.get("id", "")))
         return stale
+
+    def status_unread_and_stale(self, *, older_than_seconds: int) -> tuple[dict[str, int], list[dict[str, Any]]]:
+        ack_index = self.read_json(self.ack_index_path, {})
+        ack_ids = (
+            {str(message_id) for message_id in ack_index.keys()}
+            if isinstance(ack_index, dict)
+            else set()
+        )
+
+        unread_counts: dict[str, int] = {}
+        stale_messages: list[dict[str, Any]] = []
+        index_seen = False
+        cutoff = time.time() - older_than_seconds if older_than_seconds > 0 else None
+
+        for message_id, info in self._iter_message_index_entries():
+            index_seen = True
+            if message_id in ack_ids:
+                continue
+
+            agent = info.get("to")
+            if isinstance(agent, str) and agent:
+                unread_counts[agent] = unread_counts.get(agent, 0) + 1
+
+            if cutoff is None:
+                continue
+
+            created_at = info.get("created_at")
+            if not isinstance(created_at, str):
+                continue
+            try:
+                created_ts = parse_iso_utc(created_at).timestamp()
+            except Exception:
+                continue
+            if created_ts > cutoff:
+                continue
+
+            stale_message: dict[str, Any] = {
+                "id": message_id,
+                "to": agent,
+                "created_at": created_at,
+                "type": info.get("type"),
+            }
+            # Keep backward compatibility with richer stale message payload when needed.
+            if not isinstance(stale_message.get("type"), str):
+                loaded = self.get_message(message_id)
+                if isinstance(loaded, dict):
+                    stale_message = loaded
+            stale_messages.append(stale_message)
+
+        if not index_seen:
+            # Compatibility fallback for legacy/out-of-band states with no message index.
+            for agent in self.list_agents():
+                unread = self.list_messages_for_agent(agent, unread_only=True, limit=0)
+                unread_counts[agent] = len(unread)
+                if cutoff is None:
+                    continue
+                for message in unread:
+                    created_at = message.get("created_at")
+                    if not isinstance(created_at, str):
+                        continue
+                    try:
+                        created_ts = parse_iso_utc(created_at).timestamp()
+                    except Exception:
+                        continue
+                    if created_ts <= cutoff:
+                        stale_messages.append(message)
+
+        stale_messages.sort(key=lambda item: (item.get("created_at", ""), item.get("id", "")))
+        return unread_counts, stale_messages
 
     def replace_state_indexes(
         self,
