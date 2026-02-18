@@ -23,6 +23,13 @@ def _dlq_id() -> str:
     return f"dlq_{uuid4().hex[:12]}"
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
 class TeamChatService:
     def __init__(self, repo_root: Path):
         self.repo_root = Path(repo_root)
@@ -406,6 +413,7 @@ class TeamChatService:
         ack_index: dict[str, Any] = {}
         event_index: dict[str, Any] = {}
         task_state: dict[str, dict[str, Any]] = {}
+        task_messages: list[dict[str, Any]] = []
 
         for inbox in sorted(store.inboxes_dir.glob("*.jsonl")):
             for message in store.read_jsonl(inbox):
@@ -417,7 +425,11 @@ class TeamChatService:
                     "created_at": message.get("created_at"),
                     "to": message.get("to"),
                 }
-                self._update_task_snapshot_from_message_raw(task_state, message)
+                task_messages.append(message)
+
+        # Build task snapshots in deterministic event order regardless of inbox append order.
+        for message in sorted(task_messages, key=self._message_order_key):
+            self._update_task_snapshot_from_message_raw(task_state, message)
 
         for event_file in sorted(store.events_dir.glob("*.jsonl")):
             for event in store.read_jsonl(event_file):
@@ -468,40 +480,83 @@ class TeamChatService:
         return store.get_ack(message_id)
 
     def _update_task_snapshot_from_message(self, store: TeamStore, message: dict[str, Any]) -> None:
-        snapshots: dict[str, dict[str, Any]] = {}
-        self._update_task_snapshot_from_message_raw(snapshots, message)
-        for task_id, snapshot in snapshots.items():
+        task_id = self._validated_task_id(message)
+        if not task_id:
+            return
+
+        with store.lock("task-snapshots"):
             existing = store.read_task_snapshot(task_id) or {}
-            merged = dict(existing)
-            merged.update(snapshot)
-            merged["updated_at"] = utc_now_iso()
-            store.write_task_snapshot(task_id, merged)
+            merged, applied = self._merge_task_snapshot(
+                existing,
+                message=message,
+                task_id=task_id,
+                updated_at=utc_now_iso(),
+            )
+            if applied:
+                store.write_task_snapshot(task_id, merged)
 
     def _update_task_snapshot_from_message_raw(
         self,
         snapshots: dict[str, dict[str, Any]],
         message: dict[str, Any],
     ) -> None:
-        msg_type = message.get("type")
+        task_id = self._validated_task_id(message)
+        if not task_id:
+            return
+        current = snapshots.get(task_id, {})
+        merged, applied = self._merge_task_snapshot(
+            current,
+            message=message,
+            task_id=task_id,
+            updated_at=str(message.get("created_at") or utc_now_iso()),
+        )
+        if applied:
+            snapshots[task_id] = merged
+
+    def _validated_task_id(self, message: dict[str, Any]) -> str | None:
         task_id = message.get("task_id")
         if not isinstance(task_id, str) or not task_id:
-            return
+            return None
         try:
-            task_id = validate_identifier(task_id, field_name="task_id")
+            return validate_identifier(task_id, field_name="task_id")
         except ValueError:
             # Keep rehydrate resilient to malformed historical data.
-            return
+            return None
+
+    def _merge_task_snapshot(
+        self,
+        existing: dict[str, Any],
+        *,
+        message: dict[str, Any],
+        task_id: str,
+        updated_at: str,
+    ) -> tuple[dict[str, Any], bool]:
+        # Conflict rule: only apply messages whose (created_at, message_id) order key
+        # is strictly newer than the last snapshot marker.
+        msg_type = message.get("type")
+        if msg_type not in {"task_assign", "task_update"}:
+            return dict(existing), False
+
+        incoming_order = self._message_order_key(message)
+        current_order = self._snapshot_order_key(existing)
+        if current_order is not None and incoming_order <= current_order:
+            return dict(existing), False
 
         payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
         created_at = message.get("created_at") or utc_now_iso()
+        message_id = str(message.get("id", ""))
+        version = _safe_int(existing.get("snapshot_version"), 0)
 
-        current = snapshots.get(task_id, {})
-        snapshot = dict(current)
+        snapshot = dict(existing)
         snapshot["task_id"] = task_id
         snapshot.setdefault("created_at", created_at)
-        snapshot["updated_at"] = created_at
+        snapshot["updated_at"] = updated_at
         snapshot.setdefault("owner", message.get("to"))
         snapshot.setdefault("trace_id", message.get("trace_id"))
+        snapshot["snapshot_version"] = max(0, version) + 1
+        snapshot["last_message_id"] = message_id
+        snapshot["last_message_created_at"] = created_at
+        snapshot["snapshot_conflict_policy"] = "created_at_then_message_id_monotonic"
 
         if msg_type == "task_assign":
             snapshot["status"] = "assigned"
@@ -527,7 +582,27 @@ class TeamChatService:
                 snapshot["note"] = note
             snapshot["last_update_from"] = message.get("from")
 
-        snapshots[task_id] = snapshot
+        return snapshot, True
+
+    def _message_order_key(self, message: dict[str, Any]) -> tuple[datetime, str]:
+        created_at = message.get("created_at")
+        try:
+            created_dt = parse_iso_utc(created_at) if isinstance(created_at, str) else datetime(1970, 1, 1, tzinfo=timezone.utc)
+        except Exception:
+            created_dt = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        message_id = str(message.get("id", ""))
+        return created_dt, message_id
+
+    def _snapshot_order_key(self, snapshot: dict[str, Any]) -> tuple[datetime, str] | None:
+        created_at = snapshot.get("last_message_created_at")
+        message_id = snapshot.get("last_message_id")
+        if not isinstance(created_at, str) or not isinstance(message_id, str) or not message_id:
+            return None
+        try:
+            created_dt = parse_iso_utc(created_at)
+        except Exception:
+            created_dt = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        return created_dt, message_id
 
     def _event_matches_trace(self, event: dict[str, Any], trace_id: str) -> bool:
         return (
