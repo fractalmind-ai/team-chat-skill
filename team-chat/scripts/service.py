@@ -294,7 +294,12 @@ class TeamChatService:
         store.ensure_layout()
 
         agents = store.list_agents()
-        unread_counts = {agent: store.unread_count(agent) for agent in agents}
+        stale_seconds = stale_minutes * 60
+        unread_counts, stale_messages = store.status_unread_and_stale(
+            older_than_seconds=stale_seconds,
+        )
+        for agent in agents:
+            unread_counts.setdefault(agent, 0)
         snapshots = store.list_task_snapshots()
 
         blocked_tasks = [
@@ -304,7 +309,6 @@ class TeamChatService:
             or bool(task.get("blocked", False))
         ]
 
-        stale_seconds = stale_minutes * 60
         now_ts = time.time()
 
         stale_tasks: list[dict[str, Any]] = []
@@ -319,7 +323,6 @@ class TeamChatService:
             if age >= stale_seconds:
                 stale_tasks.append(task)
 
-        stale_messages = store.stale_unread_messages(stale_seconds)
         malformed_jsonl = store.malformed_jsonl_diagnostics()
 
         return {
@@ -424,6 +427,7 @@ class TeamChatService:
                     "inbox": inbox.name,
                     "created_at": message.get("created_at"),
                     "to": message.get("to"),
+                    "type": message.get("type"),
                 }
                 task_messages.append(message)
 

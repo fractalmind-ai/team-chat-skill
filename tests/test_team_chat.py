@@ -95,6 +95,57 @@ class TeamChatServiceTests(unittest.TestCase):
         blocked_ids = [task.get("task_id") for task in status["blocked_tasks"]]
         self.assertIn("task_alpha", blocked_ids)
 
+    def test_status_uses_message_index_without_inbox_full_scan(self) -> None:
+        for i in range(3):
+            self.service.send(
+                self.team,
+                {
+                    "id": f"msg_status_idx_{i}",
+                    "type": "handoff",
+                    "from": "lead",
+                    "to": "dev",
+                    "payload": {"i": i},
+                },
+            )
+
+        store = self.service.store(self.team)
+        original_read_jsonl = store.read_jsonl
+        inbox_read_calls: list[str] = []
+
+        def tracked_read_jsonl(path: Path) -> list[dict]:
+            if "/inboxes/" in str(path):
+                inbox_read_calls.append(str(path))
+            return original_read_jsonl(path)
+
+        store.read_jsonl = tracked_read_jsonl  # type: ignore[method-assign]
+        try:
+            status = self.service.status(self.team, stale_minutes=90)
+        finally:
+            store.read_jsonl = original_read_jsonl  # type: ignore[method-assign]
+
+        self.assertEqual(3, status["unread_counts"]["dev"])
+        self.assertEqual([], inbox_read_calls)
+
+    def test_status_index_path_ignores_corrupted_inbox_tail(self) -> None:
+        self.service.send(
+            self.team,
+            {
+                "id": "msg_status_corrupt_1",
+                "type": "handoff",
+                "from": "lead",
+                "to": "dev",
+                "payload": {"note": "ok"},
+            },
+        )
+        store = self.service.store(self.team)
+        inbox = store.inboxes_dir / "dev.jsonl"
+        with inbox.open("a", encoding="utf-8") as handle:
+            handle.write("{\"id\":\"broken\"\n")
+
+        status = self.service.status(self.team, stale_minutes=90)
+        self.assertEqual(1, status["unread_counts"]["dev"])
+        self.assertEqual(0, status["malformed_jsonl"]["total"])
+
     def test_snapshot_stale_update_does_not_overwrite_newer_state(self) -> None:
         self.service.send(
             self.team,
