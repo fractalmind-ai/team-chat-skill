@@ -95,6 +95,203 @@ class TeamChatServiceTests(unittest.TestCase):
         blocked_ids = [task.get("task_id") for task in status["blocked_tasks"]]
         self.assertIn("task_alpha", blocked_ids)
 
+    def test_snapshot_stale_update_does_not_overwrite_newer_state(self) -> None:
+        self.service.send(
+            self.team,
+            {
+                "id": "msg_order_assign",
+                "type": "task_assign",
+                "from": "lead",
+                "to": "dev",
+                "task_id": "task_ordered",
+                "created_at": "2026-02-17T10:00:00Z",
+                "payload": {"subject": "ordered"},
+            },
+        )
+        self.service.send(
+            self.team,
+            {
+                "id": "msg_order_new",
+                "type": "task_update",
+                "from": "dev",
+                "to": "lead",
+                "task_id": "task_ordered",
+                "created_at": "2026-02-17T10:02:00Z",
+                "payload": {"status": "done", "note": "newer"},
+            },
+        )
+        # Older event arrives later; it must not regress snapshot state.
+        self.service.send(
+            self.team,
+            {
+                "id": "msg_order_old",
+                "type": "task_update",
+                "from": "dev",
+                "to": "lead",
+                "task_id": "task_ordered",
+                "created_at": "2026-02-17T10:01:00Z",
+                "payload": {"status": "blocked", "blocked": True, "note": "older"},
+            },
+        )
+
+        snapshot = self.service.store(self.team).read_task_snapshot("task_ordered")
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertEqual("done", snapshot["status"])
+        self.assertEqual("newer", snapshot["note"])
+        self.assertNotIn("blocked", snapshot)
+        self.assertEqual(2, snapshot["snapshot_version"])
+        self.assertEqual("msg_order_new", snapshot["last_message_id"])
+
+    def test_snapshot_same_timestamp_uses_message_id_tiebreak(self) -> None:
+        self.service.send(
+            self.team,
+            {
+                "id": "msg_tie_assign",
+                "type": "task_assign",
+                "from": "lead",
+                "to": "dev",
+                "task_id": "task_tie",
+                "created_at": "2026-02-17T11:00:00Z",
+                "payload": {"subject": "tie"},
+            },
+        )
+        self.service.send(
+            self.team,
+            {
+                "id": "msg_tie_b",
+                "type": "task_update",
+                "from": "dev",
+                "to": "lead",
+                "task_id": "task_tie",
+                "created_at": "2026-02-17T11:01:00Z",
+                "payload": {"status": "blocked", "note": "b"},
+            },
+        )
+        self.service.send(
+            self.team,
+            {
+                "id": "msg_tie_a",
+                "type": "task_update",
+                "from": "dev",
+                "to": "lead",
+                "task_id": "task_tie",
+                "created_at": "2026-02-17T11:01:00Z",
+                "payload": {"status": "done", "note": "a"},
+            },
+        )
+        snapshot = self.service.store(self.team).read_task_snapshot("task_tie")
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertEqual("blocked", snapshot["status"])
+        self.assertEqual("b", snapshot["note"])
+        self.assertEqual("msg_tie_b", snapshot["last_message_id"])
+        self.assertEqual(2, snapshot["snapshot_version"])
+
+        self.service.send(
+            self.team,
+            {
+                "id": "msg_tie_c",
+                "type": "task_update",
+                "from": "dev",
+                "to": "lead",
+                "task_id": "task_tie",
+                "created_at": "2026-02-17T11:01:00Z",
+                "payload": {"status": "done", "note": "c"},
+            },
+        )
+        snapshot_after = self.service.store(self.team).read_task_snapshot("task_tie")
+        self.assertIsNotNone(snapshot_after)
+        assert snapshot_after is not None
+        self.assertEqual("done", snapshot_after["status"])
+        self.assertEqual("c", snapshot_after["note"])
+        self.assertEqual("msg_tie_c", snapshot_after["last_message_id"])
+        self.assertEqual(3, snapshot_after["snapshot_version"])
+
+    def test_legacy_snapshot_remains_readable_and_gets_version_metadata(self) -> None:
+        store = self.service.store(self.team)
+        store.write_task_snapshot(
+            "task_legacy",
+            {
+                "task_id": "task_legacy",
+                "status": "assigned",
+                "owner": "dev",
+                "created_at": "2026-02-17T12:00:00Z",
+                "updated_at": "2026-02-17T12:00:00Z",
+            },
+        )
+
+        self.service.send(
+            self.team,
+            {
+                "id": "msg_legacy_update",
+                "type": "task_update",
+                "from": "dev",
+                "to": "lead",
+                "task_id": "task_legacy",
+                "created_at": "2026-02-17T12:01:00Z",
+                "payload": {"status": "in_progress", "note": "migrated"},
+            },
+        )
+
+        snapshot = store.read_task_snapshot("task_legacy")
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertEqual("in_progress", snapshot["status"])
+        self.assertEqual("migrated", snapshot["note"])
+        self.assertEqual(1, snapshot["snapshot_version"])
+        self.assertEqual("msg_legacy_update", snapshot["last_message_id"])
+        self.assertEqual("2026-02-17T12:01:00Z", snapshot["last_message_created_at"])
+
+    def test_rehydrate_matches_chronological_task_ordering(self) -> None:
+        store = self.service.store(self.team)
+        inbox = store.inboxes_dir / "dev.jsonl"
+        assign = {
+            "id": "msg_rehydrate_assign",
+            "type": "task_assign",
+            "from": "lead",
+            "to": "dev",
+            "task_id": "task_rehydrate",
+            "created_at": "2026-02-17T13:00:00Z",
+            "payload": {"subject": "rehydrate"},
+            "schema_version": 1,
+            "priority": "normal",
+        }
+        old_update = {
+            "id": "msg_rehydrate_old",
+            "type": "task_update",
+            "from": "dev",
+            "to": "lead",
+            "task_id": "task_rehydrate",
+            "created_at": "2026-02-17T13:01:00Z",
+            "payload": {"status": "blocked", "blocked": True, "note": "old"},
+            "schema_version": 1,
+            "priority": "normal",
+        }
+        new_update = {
+            "id": "msg_rehydrate_new",
+            "type": "task_update",
+            "from": "dev",
+            "to": "lead",
+            "task_id": "task_rehydrate",
+            "created_at": "2026-02-17T13:02:00Z",
+            "payload": {"status": "done", "note": "new"},
+            "schema_version": 1,
+            "priority": "normal",
+        }
+        # Deliberately append out-of-order; rehydrate should sort by event order key.
+        for message in (assign, new_update, old_update):
+            store.append_jsonl(inbox, message)
+
+        self.service.rehydrate(self.team)
+        snapshot = store.read_task_snapshot("task_rehydrate")
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertEqual("done", snapshot["status"])
+        self.assertEqual("new", snapshot["note"])
+        self.assertEqual("msg_rehydrate_new", snapshot["last_message_id"])
+        self.assertEqual(3, snapshot["snapshot_version"])
+
     def test_ack_timeout_retries_to_dead_letter(self) -> None:
         result = self.service.send(
             self.team,

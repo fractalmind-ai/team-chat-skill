@@ -46,6 +46,28 @@ For write-path safety, `team`, `from`, `to`, and `agent` identifiers must match:
 - `^[A-Za-z0-9._-]+$`
 - No `/`, `\\`, or `..` traversal segments
 
+## Task Snapshot Ordering / Conflict Rules
+
+Task snapshots (`teams/<team>/tasks/*.json`) are updated with monotonic ordering guards:
+
+- Ordering key: `(message.created_at, message.id)`
+- Apply rule: apply only when incoming key is strictly newer than snapshot's last key
+- Conflict behavior: stale/out-of-order updates are ignored (no state rollback)
+- Tie-breaker: if timestamps are equal, lexicographically larger `message.id` wins
+
+Snapshot metadata:
+
+- `snapshot_version`: increments on every applied task message
+- `last_message_id`
+- `last_message_created_at`
+- `snapshot_conflict_policy` (`created_at_then_message_id_monotonic`)
+
+Compatibility / migration:
+
+- Legacy snapshots without version metadata remain readable
+- Metadata is added lazily on next applied update
+- `rehydrate` rebuilds snapshots deterministically by chronological task message order
+
 ## Skill Doc
 
 See `team-chat/SKILL.md` for full protocol and CLI reference.
