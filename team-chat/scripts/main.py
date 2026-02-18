@@ -231,6 +231,32 @@ def cmd_rehydrate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_doctor_check(args: argparse.Namespace) -> int:
+    service = TeamChatService(Path(args.data_root))
+    result = service.doctor_check(args.team, sample_size=args.sample_size)
+    if args.json:
+        _print(result, True)
+        return int(result.get("exit_code", 1))
+
+    print(f"team: {result.get('team')}")
+    print(f"overall_status: {result.get('overall_status')}")
+    for check in result.get("checks", []):
+        if not isinstance(check, dict):
+            continue
+        print(
+            f"- {check.get('name')}: status={check.get('status')} "
+            f"summary={check.get('summary')}"
+        )
+
+    recommendations = result.get("recommendations", [])
+    if isinstance(recommendations, list) and recommendations:
+        print("recommendations:")
+        for recommendation in recommendations:
+            print(f"- {recommendation}")
+
+    return int(result.get("exit_code", 1))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="team-chat file-backed control-plane CLI")
     parser.add_argument(
@@ -324,6 +350,13 @@ def build_parser() -> argparse.ArgumentParser:
     rehydrate_parser.add_argument("team")
     rehydrate_parser.set_defaults(func=cmd_rehydrate)
 
+    doctor_parser = subparsers.add_parser("doctor", help="Storage/index diagnostics")
+    doctor_subparsers = doctor_parser.add_subparsers(dest="doctor_command", required=True)
+    doctor_check_parser = doctor_subparsers.add_parser("check", help="Run health checks")
+    doctor_check_parser.add_argument("team")
+    doctor_check_parser.add_argument("--sample-size", type=int, default=100)
+    doctor_check_parser.set_defaults(func=cmd_doctor_check)
+
     return parser
 
 
@@ -334,7 +367,7 @@ def main(argv: list[str] | None = None) -> int:
         return args.func(args)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
-        return 2
+        return 1
 
 
 if __name__ == "__main__":

@@ -336,6 +336,288 @@ class TeamChatService:
             "task_count": len(snapshots),
         }
 
+    def doctor_check(self, team: str, *, sample_size: int = 100) -> dict[str, Any]:
+        if sample_size <= 0:
+            raise ValueError("sample_size must be > 0")
+
+        store = self.store(team)
+        store.ensure_layout()
+
+        index_entries = list(store._iter_message_index_entries())  # noqa: SLF001
+        index_ids = {message_id for message_id, _ in index_entries}
+        index_map = {message_id: info for message_id, info in index_entries}
+
+        inbox_message_ids: set[str] = set()
+        inbox_message_count = 0
+        for inbox in sorted(store.inboxes_dir.glob("*.jsonl")):
+            for message in store.read_jsonl(inbox):
+                message_id = message.get("id")
+                if isinstance(message_id, str) and message_id:
+                    inbox_message_ids.add(message_id)
+                    inbox_message_count += 1
+
+        checks = [
+            self._doctor_check_index_integrity(
+                store=store,
+                index_ids=index_ids,
+                inbox_message_ids=inbox_message_ids,
+            ),
+            self._doctor_check_malformed_jsonl(store=store),
+            self._doctor_check_snapshot_monotonicity(store=store),
+            self._doctor_check_index_inbox_sample(
+                store=store,
+                index_map=index_map,
+                sample_size=sample_size,
+            ),
+            self._doctor_check_ack_consistency(
+                store=store,
+                sample_size=sample_size,
+            ),
+        ]
+
+        statuses = [str(check.get("status", "healthy")) for check in checks]
+        if "unhealthy" in statuses:
+            overall_status = "unhealthy"
+            exit_code = 2
+        elif "warn" in statuses:
+            overall_status = "warn"
+            exit_code = 0
+        else:
+            overall_status = "healthy"
+            exit_code = 0
+
+        malformed = store.malformed_jsonl_diagnostics()
+        malformed_total = int(malformed.get("total", 0)) if isinstance(malformed, dict) else 0
+        raw_ack_index = store.read_json(store.ack_index_path, {})
+        ack_index = raw_ack_index if isinstance(raw_ack_index, dict) else {}
+
+        recommendations: list[str] = []
+        if overall_status == "unhealthy":
+            recommendations.append("Run `rehydrate` to rebuild derived indexes/snapshots if index consistency is broken.")
+            recommendations.append("Inspect `state/malformed-jsonl.json` and repair malformed JSONL sources.")
+        elif overall_status == "warn":
+            recommendations.append("Review warning checks and consider running `rehydrate` during a low-traffic window.")
+
+        return {
+            "team": team,
+            "generated_at": utc_now_iso(),
+            "overall_status": overall_status,
+            "exit_code": exit_code,
+            "checks": checks,
+            "stats": {
+                "sample_size": sample_size,
+                "inbox_message_count": inbox_message_count,
+                "message_index_count": len(index_ids),
+                "task_snapshot_count": len(list(store.tasks_dir.glob("*.json"))),
+                "ack_index_count": len(ack_index),
+                "malformed_jsonl_total": malformed_total,
+            },
+            "recommendations": recommendations,
+        }
+
+    def _doctor_check_index_integrity(
+        self,
+        *,
+        store: TeamStore,
+        index_ids: set[str],
+        inbox_message_ids: set[str],
+    ) -> dict[str, Any]:
+        message_marker = store._index_migration_marker(store.message_index_shards_dir).exists()  # noqa: SLF001
+        event_marker = store._index_migration_marker(store.event_index_shards_dir).exists()  # noqa: SLF001
+
+        message_shards = sorted(store.message_index_shards_dir.glob("*.json"))
+        event_shards = sorted(store.event_index_shards_dir.glob("*.json"))
+        invalid_message_shards = 0
+        invalid_event_shards = 0
+        for shard in message_shards:
+            if not isinstance(store.read_json(shard, {}), dict):
+                invalid_message_shards += 1
+        for shard in event_shards:
+            if not isinstance(store.read_json(shard, {}), dict):
+                invalid_event_shards += 1
+
+        missing_index_entries = len(inbox_message_ids - index_ids)
+        orphan_index_entries = len(index_ids - inbox_message_ids)
+
+        legacy_message_index_exists = store.message_index_path.exists()
+        legacy_event_index_exists = store.event_index_path.exists()
+
+        if invalid_message_shards > 0 or invalid_event_shards > 0 or missing_index_entries > 0:
+            status = "unhealthy"
+        elif (
+            (not message_marker and len(message_shards) > 0)
+            or (not event_marker and len(event_shards) > 0)
+            or legacy_message_index_exists
+            or legacy_event_index_exists
+            or orphan_index_entries > 0
+        ):
+            status = "warn"
+        else:
+            status = "healthy"
+
+        summary = (
+            f"missing_index_entries={missing_index_entries}, "
+            f"orphan_index_entries={orphan_index_entries}, "
+            f"invalid_message_shards={invalid_message_shards}, "
+            f"invalid_event_shards={invalid_event_shards}"
+        )
+
+        return {
+            "name": "index_integrity",
+            "status": status,
+            "summary": summary,
+            "details": {
+                "message_marker_present": message_marker,
+                "event_marker_present": event_marker,
+                "message_shard_count": len(message_shards),
+                "event_shard_count": len(event_shards),
+                "invalid_message_shards": invalid_message_shards,
+                "invalid_event_shards": invalid_event_shards,
+                "legacy_message_index_exists": legacy_message_index_exists,
+                "legacy_event_index_exists": legacy_event_index_exists,
+                "inbox_message_id_count": len(inbox_message_ids),
+                "message_index_id_count": len(index_ids),
+                "missing_index_entries": missing_index_entries,
+                "orphan_index_entries": orphan_index_entries,
+            },
+        }
+
+    def _doctor_check_malformed_jsonl(self, *, store: TeamStore) -> dict[str, Any]:
+        diagnostics = store.malformed_jsonl_diagnostics()
+        total = int(diagnostics.get("total", 0)) if isinstance(diagnostics, dict) else 0
+        status = "unhealthy" if total > 0 else "healthy"
+        return {
+            "name": "malformed_jsonl",
+            "status": status,
+            "summary": f"total={total}",
+            "details": diagnostics if isinstance(diagnostics, dict) else {"total": 0, "files": []},
+        }
+
+    def _doctor_check_snapshot_monotonicity(self, *, store: TeamStore) -> dict[str, Any]:
+        violations: list[dict[str, str]] = []
+        snapshot_count = 0
+        for path in sorted(store.tasks_dir.glob("*.json")):
+            payload = store.read_json(path, None)
+            snapshot_count += 1
+            if not isinstance(payload, dict):
+                violations.append({"path": str(path), "reason": "snapshot is not an object"})
+                continue
+
+            task_id = str(payload.get("task_id", path.stem))
+            version = payload.get("snapshot_version")
+            last_message_id = payload.get("last_message_id")
+            last_message_created_at = payload.get("last_message_created_at")
+
+            if last_message_id is not None and not isinstance(last_message_id, str):
+                violations.append({"task_id": task_id, "reason": "last_message_id is not a string"})
+            if isinstance(last_message_id, str) and last_message_id and not isinstance(last_message_created_at, str):
+                violations.append({"task_id": task_id, "reason": "last_message_created_at missing while last_message_id exists"})
+            if isinstance(last_message_created_at, str):
+                try:
+                    parse_iso_utc(last_message_created_at)
+                except Exception:
+                    violations.append({"task_id": task_id, "reason": "last_message_created_at is not valid ISO8601 UTC"})
+
+            if version is not None:
+                try:
+                    parsed_version = int(version)
+                except Exception:
+                    violations.append({"task_id": task_id, "reason": "snapshot_version is not an integer"})
+                else:
+                    if parsed_version < 1:
+                        violations.append({"task_id": task_id, "reason": "snapshot_version must be >= 1"})
+
+        status = "unhealthy" if violations else "healthy"
+        return {
+            "name": "snapshot_monotonicity",
+            "status": status,
+            "summary": f"violations={len(violations)}",
+            "details": {
+                "snapshot_count": snapshot_count,
+                "violation_count": len(violations),
+                "violations_sample": violations[:5],
+            },
+        }
+
+    def _doctor_check_index_inbox_sample(
+        self,
+        *,
+        store: TeamStore,
+        index_map: dict[str, dict[str, Any]],
+        sample_size: int,
+    ) -> dict[str, Any]:
+        sample_ids = sorted(index_map.keys())[:sample_size]
+        matched = 0
+        mismatched = 0
+        missing_offset = 0
+        read_errors = 0
+
+        for message_id in sample_ids:
+            info = index_map.get(message_id, {})
+            inbox_name = info.get("inbox")
+            if not isinstance(inbox_name, str) or not inbox_name:
+                read_errors += 1
+                continue
+            inbox_path = store.inboxes_dir / inbox_name
+            offset = info.get("offset")
+            if not isinstance(offset, int):
+                missing_offset += 1
+                continue
+
+            record = store._read_jsonl_record_at_offset(inbox_path, offset)  # noqa: SLF001
+            if not isinstance(record, dict):
+                read_errors += 1
+                continue
+            if record.get("id") == message_id:
+                matched += 1
+            else:
+                mismatched += 1
+
+        if mismatched > 0 or read_errors > 0:
+            status = "unhealthy"
+        elif missing_offset > 0:
+            status = "warn"
+        else:
+            status = "healthy"
+
+        return {
+            "name": "index_inbox_sample_consistency",
+            "status": status,
+            "summary": (
+                f"sampled={len(sample_ids)}, matched={matched}, mismatched={mismatched}, "
+                f"missing_offset={missing_offset}, read_errors={read_errors}"
+            ),
+            "details": {
+                "sampled": len(sample_ids),
+                "matched": matched,
+                "mismatched": mismatched,
+                "missing_offset": missing_offset,
+                "read_errors": read_errors,
+            },
+        }
+
+    def _doctor_check_ack_consistency(self, *, store: TeamStore, sample_size: int) -> dict[str, Any]:
+        raw_ack_index = store.read_json(store.ack_index_path, {})
+        ack_index = raw_ack_index if isinstance(raw_ack_index, dict) else {}
+
+        sampled_ids = sorted(str(message_id) for message_id in ack_index.keys())[:sample_size]
+        dangling = 0
+        for message_id in sampled_ids:
+            if store.get_message(message_id) is None:
+                dangling += 1
+
+        status = "unhealthy" if dangling > 0 else "healthy"
+        return {
+            "name": "ack_index_consistency",
+            "status": status,
+            "summary": f"sampled={len(sampled_ids)}, dangling={dangling}",
+            "details": {
+                "ack_index_count": len(ack_index),
+                "sampled": len(sampled_ids),
+                "dangling": dangling,
+            },
+        }
+
     def trace(
         self,
         team: str,
