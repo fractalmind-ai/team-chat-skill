@@ -22,6 +22,7 @@ $CLI read demo --agent dev --unread
 $CLI ack demo --agent dev --message-id <MESSAGE_ID>
 $CLI status demo
 $CLI trace demo --trace-id tr_1
+$CLI --json doctor check demo
 $CLI read demo --agent dev --unread --limit 50 --json
 # use returned next_cursor for older page
 $CLI read demo --agent dev --unread --limit 50 --cursor <NEXT_CURSOR> --json
