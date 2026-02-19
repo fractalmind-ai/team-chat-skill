@@ -76,3 +76,7 @@ See `team-chat/SKILL.md` for full protocol and CLI reference.
 ## Storage and Filesystem Notes
 
 - See `docs/filesystem-semantics.md` for locking model, atomicity boundaries, JSONL/index behavior, supported environments, and recovery/ops guidance.
+
+## unread_notifier Ops Guide
+
+- See `docs/unread-notifier-cron-guide.md` for copy-pastable cron/systemd setup, logging/logrotate, exit code semantics, and healthcheck/OpenClaw integration patterns.
