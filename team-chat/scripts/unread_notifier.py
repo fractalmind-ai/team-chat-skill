@@ -20,9 +20,21 @@ import subprocess
 import sys
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
+
+# Support running as a script (cron) without requiring `pip install -e .`.
+try:
+    from team_chat.scripts.service_state import dump_json_one_line, update_service_state
+    from team_chat.scripts.repo_root import get_repo_root
+except ModuleNotFoundError:  # pragma: no cover
+    _here = Path(__file__).resolve()
+    _pkg_root = _here.parents[1]  # team-chat/
+    if str(_pkg_root) not in sys.path:
+        sys.path.insert(0, str(_pkg_root))
+    from scripts.service_state import dump_json_one_line, update_service_state  # type: ignore
+    from scripts.repo_root import get_repo_root  # type: ignore
 
 
 EMP_RE = re.compile(r"^(?:EMP_)?(\d{4})$")
@@ -146,9 +158,42 @@ def should_nudge(
     return (now_s - last_nudge_at) >= cooldown_s
 
 
+def _workspace_root_from_projects_path(path: Path) -> Path | None:
+    parts = list(path.resolve().parts)
+    try:
+        idx = parts.index("projects")
+    except ValueError:
+        return None
+    # Expect .../<workspace>/projects/<org>/<repo>/...
+    if idx <= 0 or idx + 2 >= len(parts):
+        return None
+    return Path(*parts[:idx])
+
+
+def _default_data_root() -> Path:
+    # Prefer the shared resolver (env + git + OpenClaw-aware heuristics).
+    candidate = get_repo_root().resolve()
+    if (candidate / "teams").exists():
+        return candidate
+
+    workspace = _workspace_root_from_projects_path(candidate)
+    if workspace is not None:
+        return workspace
+
+    script_workspace = _workspace_root_from_projects_path(Path(__file__).resolve())
+    if script_workspace is not None:
+        return script_workspace
+
+    return candidate if candidate.exists() else Path.cwd().resolve()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data-root", default=".", help="Repo root where teams/<team>/ state is stored")
+    ap.add_argument(
+        "--data-root",
+        default="",
+        help="Repo root where teams/<team>/ state is stored",
+    )
     ap.add_argument("--interval-minutes", type=int, default=5, help="Used for logs only")
     ap.add_argument("--cooldown-minutes", type=int, default=15, help="Per-(team,member) cooldown")
     ap.add_argument(
@@ -156,24 +201,35 @@ def main() -> int:
         default="",
         help="Comma-separated team names to check (default: scan data-root/teams/*)",
     )
+    ap.add_argument(
+        "--state-dir",
+        default="",
+        help="When set, write cron-friendly state files (last_run/last_ok/fail_count) to this directory",
+    )
+    ap.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit a single-line JSON summary to stdout (cron/ops friendly)",
+    )
 
     args = ap.parse_args()
 
-    repo_root = Path(args.data_root).resolve()
+    repo_root = Path(args.data_root).resolve() if args.data_root.strip() else _default_data_root()
     teams_dir = repo_root / "teams"
     if not teams_dir.exists():
         _eprint(f"error: teams dir not found: {teams_dir}")
         return 2
 
     # Resolve agent-manager script relative to the OpenClaw workspace layout.
-    # This keeps cron invocation simple (just cd repo_root and run this script).
-    workspace_root = repo_root.parent.parent.parent  # .../work-assistant/projects/fractalmind-ai/team-chat-skill
+    # This keeps cron invocation simple (just run this script anywhere).
+    workspace_root = repo_root
     agent_manager_path = workspace_root / ".agent" / "skills" / "agent-manager" / "scripts" / "main.py"
     if not agent_manager_path.exists():
         _eprint(f"error: agent-manager not found: {agent_manager_path}")
         return 2
 
-    team_chat_main = repo_root / "team-chat" / "scripts" / "main.py"
+    # team-chat is vendored under the workspace projects/ tree.
+    team_chat_main = repo_root / "projects" / "fractalmind-ai" / "team-chat-skill" / "team-chat" / "scripts" / "main.py"
     if not team_chat_main.exists():
         _eprint(f"error: team-chat main not found: {team_chat_main}")
         return 2
@@ -264,16 +320,45 @@ def main() -> int:
         if changed:
             save_state(state_path, state)
 
-    # Human-readable summary for cron logs.
-    if nudged:
-        print(f"nudged={len(nudged)} " + " ".join([f"{t}:{m}({c})" for t, m, c in nudged]))
+    ok = len(errors) == 0
+
+    # Optional: emit state files for cron/healthcheck without wrapper scripts.
+    state_result = None
+    if args.state_dir.strip():
+        try:
+            state_result = update_service_state(
+                Path(args.state_dir),
+                ok=ok,
+                error=("; ".join(errors[:3]) if errors else None),
+            )
+        except Exception as e:
+            # If state update fails, treat as a hard error for monitoring.
+            errors.append(f"state update failed: {e}")
+            ok = False
+
+    if args.json:
+        payload: Dict[str, Any] = {
+            "ok": ok,
+            "nudged_count": len(nudged),
+            "teams_scanned": len(teams),
+            "members_nudged": [{"team": t, "member": m, "unread": c} for t, m, c in nudged],
+        }
+        if errors:
+            payload["errors"] = errors
+        if state_result is not None:
+            payload["state"] = asdict(state_result)
+        sys.stdout.write(dump_json_one_line(payload))
     else:
-        print("nudged=0")
+        # Human-readable summary for cron logs.
+        if nudged:
+            print(f"nudged={len(nudged)} " + " ".join([f"{t}:{m}({c})" for t, m, c in nudged]))
+        else:
+            print("nudged=0")
 
-    for e in errors:
-        _eprint("warn: " + e)
+        for e in errors:
+            _eprint("warn: " + e)
 
-    return 0
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
