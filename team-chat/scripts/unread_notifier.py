@@ -26,13 +26,13 @@ from typing import Any, Dict, Optional, Tuple
 
 # Support running as a script (cron) without requiring `pip install -e .`.
 try:
-    from team_chat.scripts.service import dump_json_one_line, update_service_state
+    from team_chat.scripts.service_state import dump_json_one_line, update_service_state
 except ModuleNotFoundError:  # pragma: no cover
     _here = Path(__file__).resolve()
     _pkg_root = _here.parents[1]  # team-chat/
     if str(_pkg_root) not in sys.path:
         sys.path.insert(0, str(_pkg_root))
-    from scripts.service import dump_json_one_line, update_service_state  # type: ignore
+    from scripts.service_state import dump_json_one_line, update_service_state  # type: ignore
 
 
 EMP_RE = re.compile(r"^(?:EMP_)?(\d{4})$")
