@@ -1,195 +1,231 @@
 # File System Semantics and Operational Constraints
 
-This document explains the on-disk contract used by `team-chat-skill`, what environments are supported, and how to operate and recover safely.
+This document defines the runtime contract for file-backed storage in `team-chat-skill`.
+It is written for operators running cron jobs and long-lived automation.
 
-## Scope and Guarantees
+## Supported / Not Supported / Recommended
 
-- Storage backend is plain files under `teams/<team>/`.
-- Message and event logs are append-only JSONL.
-- Indexes and snapshots are derived state that can be rebuilt (`rehydrate`).
-- Atomic replace is used for JSON state files (`write temp -> os.replace`).
-- Locking uses POSIX `flock` lock files per team.
+### Supported
 
-Non-goals:
+- Linux and macOS hosts using a local POSIX filesystem.
+- Single-host deployment where all writers/readers share one local path.
+- Multiple processes on the same host coordinating via `flock` lock files.
 
-- No distributed transaction across multiple files.
-- No strict crash-consistency guarantee across "append log + update index" without `fsync`.
-- No support for multi-host shared-storage semantics.
+### Not Supported
 
-## Directory Layout
+- Windows runtime for storage locking (`fcntl`/`flock` is POSIX-only in this codebase).
+- Cross-host correctness guarantees on shared/network filesystems.
+- Distributed transaction semantics across inbox/events/index/snapshot files.
 
-Per team directory:
+### Recommended
+
+- Local SSD/NVMe disk for `teams/<team>/` data.
+- One service account with explicit read/write permissions to the data root.
+- Host-level snapshots/backups for durability and rollback.
+- Periodic `rehydrate` in maintenance windows when diagnosing index drift.
+
+## 1) Storage Semantics and Path/Permission Constraints
+
+Data root layout per team:
 
 ```text
 teams/<team>/
-  inboxes/
-    <agent>.jsonl                  # append-only message log per receiver
-  events/
-    YYYY-MM-DD.jsonl               # append-only event log by day
-  tasks/
-    <task_id>.json                 # current task snapshot
+  inboxes/<agent>.jsonl
+  events/YYYY-MM-DD.jsonl
+  tasks/<task_id>.json
   state/
-    ack-index.json                 # message_id -> ack metadata
-    nudge-index.json               # cooldown state
-    malformed-jsonl.json           # malformed diagnostics state
-    message-index.json             # legacy message index (compat)
-    event-index.json               # legacy event index (compat)
-    message-index-shards/*.json    # active message index shards
-    event-index-shards/*.json      # active event index shards
-    message-index-shards/.migrated # marker for shard migration state
-    event-index-shards/.migrated   # marker for shard migration state
-  dead-letter/
-    YYYY-MM-DD.jsonl               # failed deliveries / timeout outputs
-  locks/
-    *.lock                         # flock lock files
+    ack-index.json
+    nudge-index.json
+    malformed-jsonl.json
+    message-index.json          # legacy
+    event-index.json            # legacy
+    message-index-shards/*.json
+    event-index-shards/*.json
+    message-index-shards/.migrated
+    event-index-shards/.migrated
+  dead-letter/YYYY-MM-DD.jsonl
+  locks/*.lock
 ```
 
-## Concurrency and Locking
+Path safety rules in protocol validation:
 
-Locking is per team and per lock file:
+- `team`, `agent`, `from`, `to`, `task_id` must match `^[A-Za-z0-9._-]+$`.
+- Path separators and traversal tokens are rejected.
 
-- `messages.lock`: message append + message-index update
-- `events.lock`: event append + event-index update
-- `acks.lock`: ack index updates
-- `task-snapshots.lock`: task snapshot merge/write
-- `state-rehydrate.lock`: index replacement during `rehydrate`
-- `malformed-jsonl.lock`: malformed diagnostics updates
-- `dead-letter.lock`: dead-letter appends
-- `nudge-cooldown.lock`: cooldown state updates
+Permission assumptions:
 
-Current behavior:
+- Process user must have read/write/execute on `teams/<team>/` and children.
+- Locks require write access to `teams/<team>/locks/`.
+- Atomic replace requires write access to both target directory and temp file path.
 
-- Critical write paths use a single lock at a time.
-- Lock scope is process-level mutual exclusion for cooperating processes on the same machine.
-- Locks are isolated per team (`teams/<team>/locks/*.lock`), so teams do not block each other.
+Practical recommendation:
 
-Lock-order guidance (for future changes):
+- Set owner-only write permissions for production (for example, `0750` dir + service account group policy).
+- Avoid world-writable data roots.
 
-- Keep single-lock critical sections whenever possible.
-- If multi-lock logic is added, enforce one global order and never invert it.
-- Suggested order: `messages -> events -> acks -> task-snapshots -> state-rehydrate -> malformed-jsonl`.
+## 2) Concurrency Model (`flock`) and Boundaries
 
-## Atomicity and Crash Windows
+Locking model:
 
-### JSON state files
+- Lock files are per-team, per-resource (for example `messages.lock`, `events.lock`, `acks.lock`).
+- Writers acquire an exclusive `flock` around critical sections.
+- Team A and Team B do not block each other because lock paths differ.
 
-`write_json_atomic()` writes to a temp file in the same directory and then uses `os.replace()`:
+What is guaranteed:
 
-- Prevents partial-content reads of the target JSON file.
-- Final rename is atomic on local POSIX filesystems.
-- Existing file is replaced in one step.
+- Same-host cooperating processes that use these lock files serialize correctly.
+- Lock lifetime is tied to process/file descriptor lifetime.
 
-### JSONL append files
+What is not guaranteed:
 
-`append_jsonl()` appends one serialized line plus newline:
+- Cross-host mutual exclusion on NFS/SMB is not guaranteed in all environments.
+- Non-cooperating writers that bypass lock files can corrupt assumptions.
 
-- Append-only semantics for logical history.
-- Not a multi-file transaction.
-- No explicit `fsync`, so sudden power loss can still lose the latest buffered writes.
+Why NFS can fail here (concrete):
 
-### Known partial-failure windows
+- Some NFS deployments have weak/disabled lock daemons or split-brain lock behavior under network partitions.
+- Host A may believe it holds `messages.lock` while Host B proceeds after stale lock state.
+- Result: concurrent append/index updates can diverge.
 
-- Message append succeeds but index update does not:
-  - Message exists in inbox, index entry may be missing.
-  - Fallback scanning and `rehydrate` can recover derived state.
-- Index update succeeds but process crashes before other related writes:
-  - Temporary inconsistencies can occur until next successful operation or `rehydrate`.
-- Malformed/truncated JSONL tail after crash:
-  - Reader skips malformed records and records diagnostics (not hard-fail).
+## 3) Atomic Write Semantics (`tmp + fsync + os.replace`)
 
-## Index and JSONL Semantics
+Current implementation behavior:
 
-### Append-only logs
+- JSON state files are written to a temp file, then `os.replace(temp, target)`.
+- This protects readers from seeing partially written target JSON files.
+- JSONL logs use append writes and are not transactional with index updates.
 
-- `inboxes/*.jsonl` and `events/*.jsonl` are append-only.
-- Ordering is file append order; some rebuild flows sort by `(created_at, id)` for determinism.
+Durability nuance:
 
-### Index usage and fallback
+- Current code does **not** call `fsync` on file and parent directory before/after replace.
+- Therefore crash/power-loss durability is best-effort, not fully crash-safe durability.
 
-- Primary fast path uses sharded indexes in `state/*-index-shards/`.
-- Legacy single-file indexes are read for compatibility before migration marker exists.
-- Status/read paths may fallback to inbox scans when index data is absent.
-- `status()` fast path uses message index + ack index, with compatibility fallback.
+Operator-facing semantics:
 
-### Malformed JSONL handling
+- Atomic visibility: mostly yes for target JSON replacement on local POSIX filesystems.
+- Crash durability: not guaranteed for the very latest write without explicit `fsync`.
+- Cross-file atomicity (for example inbox append + index update): not guaranteed.
 
-- Malformed/non-object lines are skipped.
-- Diagnostics are persisted in `state/malformed-jsonl.json`.
-- Dedupe key includes line hash (and line number when known), so repeated reads do not inflate counts.
-- Set `TEAM_CHAT_WARN_MALFORMED=1` to emit one warning per new malformed fingerprint.
+Failure window examples:
 
-## Supported and Unsupported Runtime Environments
+- Inbox append succeeds, index write fails: message exists but lookup may fallback/lag.
+- Index write succeeds, subsequent step fails: temporary inconsistency until retry/rehydrate.
+- Crash during append: trailing malformed JSONL line can appear and is skipped with diagnostics.
 
-Recommended:
+## 4) Shards, Retention, Cleanup, and `unlink` Risks
 
-- Local Linux/macOS filesystem (for example ext4/xfs/apfs local disk).
-- Single host where all writers/readers share the same local filesystem semantics.
+Index sharding:
 
-Not recommended:
+- Message/event indexes are stored in shard JSON files.
+- Legacy single-file indexes are compatibility-only; shard markers (`.migrated`) indicate shard mode.
 
-- NFS/SMB/network filesystems.
-- Cloud sync folders (for example Dropbox/iCloud/OneDrive style replication).
-- Any environment where `flock` semantics, rename atomicity, or close-to-open consistency are weak.
+Cleanup/compaction behavior today:
 
-Platform notes:
+- No automatic inbox/event log compaction.
+- Rehydrate/replace flows can remove old shard files (`unlink`) before writing rebuilt shards.
 
-- Linux/macOS: expected path (POSIX `fcntl.flock` available).
-- Windows: currently unsupported (module imports `fcntl`; lock model is POSIX-specific).
+Operational risks:
 
-## Operations Guidance
+- Interrupting a manual cleanup script mid-run can leave partial shard sets.
+- Deleting inbox/event logs without coordinated index/snapshot rebuild can create dangling references.
 
-### Backups
+Safe cleanup strategy:
 
-- Back up the full `teams/<team>/` tree, not only `state/`.
-- `inboxes/` and `events/` are source-of-truth history; indexes/snapshots are rebuildable.
-- For consistent snapshots, quiesce writers or take filesystem snapshots at host/storage layer.
+1. Stop writers (or schedule maintenance window).
+2. Backup full `teams/<team>/`.
+3. Run cleanup/retention action.
+4. Run `rehydrate` to rebuild derived state.
+5. Run `doctor check` and verify status before resuming traffic.
 
-### Monitoring
+Retention guidance:
 
-- Watch `status` output for `malformed_jsonl_total`.
-- Alert on growth of:
-  - `dead-letter/*.jsonl`
-  - `state/malformed-jsonl.json` totals
-  - unexpected divergence between unread behavior and operator expectations
+- Treat `inboxes/` and `events/` as source-of-truth history.
+- Treat `state/*index*` and `tasks/*.json` as rebuildable derived state.
 
-### Disk and retention
+## 5) Deployment Guidance and Minimum Baseline
 
-- JSONL logs grow unbounded by default.
-- Plan retention/archival for old inbox and event files.
-- Keep enough free space to allow temp-file + replace writes.
+Recommended deployment profile:
 
-### Permissions
+- Local filesystem only (ext4/xfs/apfs class local disk).
+- One host per writable data root.
+- Cron or supervisor launches with stable service user.
 
-- Run with least privilege.
-- Ensure process user can read/write under `teams/<team>/`.
-- Restrict group/world write permissions unless intentionally shared.
+Not recommended deployment profile:
 
-## FAQ and Failure Modes
+- NFS/SMB mounted data roots.
+- Dropbox/OneDrive/iCloud synced folders.
+- Multi-host active-active writes to the same `teams/` tree.
 
-### Why is `status` slower than expected?
+Why cloud sync folders break assumptions (concrete):
 
-- If message index is missing or partially unavailable, status can fallback to inbox scanning.
-- Run `rehydrate` to rebuild indexes and snapshots from logs.
+- Sync tools can upload temp files and merge/rename asynchronously.
+- Conflict copies can appear (`file (conflicted copy).json`) outside protocol expectations.
+- `flock` does not coordinate through remote sync engines.
 
-### Why do I see malformed JSONL counters increasing?
+Minimum practical baseline:
 
-- A log contains invalid JSON or non-object JSON lines.
-- Records are skipped by design to keep service running.
-- Inspect `state/malformed-jsonl.json` for file path, reason, and last seen location.
+- 1 vCPU, 1 GB RAM, local SSD, stable clock (NTP), and enough disk headroom for append-only logs.
+- Alerts for malformed growth, dead-letter growth, and disk utilization.
 
-### Can I delete index files to fix corruption?
+## 6) Troubleshooting and Recovery
 
-- Yes, indexes are derived state.
-- Preferred recovery path: run `rehydrate` to rebuild from inbox/events logs.
+### Symptom: `doctor check` reports index inconsistency
 
-### Can old snapshots or indexes still be read?
+Likely causes:
 
-- Legacy index/snapshot formats are kept readable with compatibility fallbacks.
-- New writes prefer sharded indexes and monotonic snapshot metadata.
+- Partial index rewrite.
+- Manual deletion of shard files.
+- Crash between append and index update.
 
-### What if process crashes mid-write?
+Recovery:
 
-- JSON state files use atomic replace, so target files should not contain partial JSON payload.
-- JSONL files may have a truncated tail line; malformed handling skips it and records diagnostics.
-- Rebuild command (`rehydrate`) is the standard recovery tool for derived state consistency.
+1. Backup current `teams/<team>/`.
+2. Run `rehydrate`.
+3. Re-run `doctor check` and confirm healthy/warn state is expected.
 
+### Symptom: malformed JSONL counter keeps increasing
+
+Likely causes:
+
+- External script writing non-JSON or truncated lines.
+- Storage corruption in tail lines after abrupt restart.
+
+Recovery:
+
+1. Inspect `state/malformed-jsonl.json` for path/reason.
+2. Repair producer or rotate affected log file during maintenance.
+3. Rehydrate if derived state drift is suspected.
+
+### Symptom: permission denied errors in cron
+
+Likely causes:
+
+- Service user mismatch.
+- Directory ownership/mode drift after deployment changes.
+
+Recovery:
+
+1. Verify service user and group.
+2. Fix ownership/modes on `teams/` tree.
+3. Re-run command with `--json` and verify exit code/summary.
+
+### Symptom: stale health despite process running
+
+Likely causes:
+
+- Cron executes but fails before writing state output.
+- Shared storage latency causing inconsistent reads.
+
+Recovery:
+
+1. Run command manually with `--json`.
+2. Verify local disk path and remove shared-sync mount from write path.
+3. Add watchdog based on `last_ok` freshness and failure counters.
+
+## Quick Ops Checklist
+
+- Use local disk, not NFS/cloud-sync.
+- Keep one writer domain per team data root.
+- Monitor malformed/dead-letter/disk growth.
+- Backup first, then cleanup.
+- Use `rehydrate` + `doctor check` as the standard recovery loop.
