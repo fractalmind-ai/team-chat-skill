@@ -27,12 +27,14 @@ from typing import Any, Dict, Optional, Tuple
 # Support running as a script (cron) without requiring `pip install -e .`.
 try:
     from team_chat.scripts.service_state import dump_json_one_line, update_service_state
+    from team_chat.scripts.repo_root import get_repo_root
 except ModuleNotFoundError:  # pragma: no cover
     _here = Path(__file__).resolve()
     _pkg_root = _here.parents[1]  # team-chat/
     if str(_pkg_root) not in sys.path:
         sys.path.insert(0, str(_pkg_root))
     from scripts.service_state import dump_json_one_line, update_service_state  # type: ignore
+    from scripts.repo_root import get_repo_root  # type: ignore
 
 
 EMP_RE = re.compile(r"^(?:EMP_)?(\d{4})$")
@@ -156,11 +158,40 @@ def should_nudge(
     return (now_s - last_nudge_at) >= cooldown_s
 
 
+def _workspace_root_from_projects_path(path: Path) -> Path | None:
+    parts = list(path.resolve().parts)
+    try:
+        idx = parts.index("projects")
+    except ValueError:
+        return None
+    # Expect .../<workspace>/projects/<org>/<repo>/...
+    if idx <= 0 or idx + 2 >= len(parts):
+        return None
+    return Path(*parts[:idx])
+
+
+def _default_data_root() -> Path:
+    # Prefer the shared resolver (env + git + OpenClaw-aware heuristics).
+    candidate = get_repo_root().resolve()
+    if (candidate / "teams").exists():
+        return candidate
+
+    workspace = _workspace_root_from_projects_path(candidate)
+    if workspace is not None:
+        return workspace
+
+    script_workspace = _workspace_root_from_projects_path(Path(__file__).resolve())
+    if script_workspace is not None:
+        return script_workspace
+
+    return candidate if candidate.exists() else Path.cwd().resolve()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--data-root",
-        default=str(Path(__file__).resolve().parents[5]),
+        default="",
         help="Repo root where teams/<team>/ state is stored",
     )
     ap.add_argument("--interval-minutes", type=int, default=5, help="Used for logs only")
@@ -183,7 +214,7 @@ def main() -> int:
 
     args = ap.parse_args()
 
-    repo_root = Path(args.data_root).resolve()
+    repo_root = Path(args.data_root).resolve() if args.data_root.strip() else _default_data_root()
     teams_dir = repo_root / "teams"
     if not teams_dir.exists():
         _eprint(f"error: teams dir not found: {teams_dir}")
