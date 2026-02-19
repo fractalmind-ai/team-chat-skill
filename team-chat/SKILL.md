@@ -92,3 +92,23 @@ Supported message types:
 - Rehydrate: rebuild task/index state from append-only logs.
 - Nudge cooldown: `send --cooldown-seconds` suppresses spam repeats.
 - Path safety: `team`, `from`, `to`, and `agent` must match `^[A-Za-z0-9._-]+$` and cannot contain path separators/traversal tokens.
+
+## unread_notifier Cron Integration
+
+Use this when you want low-token periodic nudges without running an LLM loop.
+
+Minimal Linux crontab example (every 5 minutes):
+
+```cron
+*/5 * * * * /usr/bin/python3 /home/elliot245/work-assistant/projects/fractalmind-ai/team-chat-skill/team-chat/scripts/unread_notifier.py --data-root /home/elliot245/work-assistant --interval-minutes 5 --cooldown-minutes 15 --state-dir /home/elliot245/work-assistant/.state/team-chat --json >> /home/elliot245/work-assistant/logs/team-chat-unread-notifier.log 2>&1
+```
+
+Key points:
+
+- Use absolute paths only.
+- Prefer `--state-dir` + `--json` for health checks/alerts.
+- Exit codes: `0` success, `1` runtime/operational errors, `2` config/bootstrap errors.
+
+Full guide (cron + logrotate + systemd timer + healthcheck/OpenClaw patterns):
+
+- `docs/unread-notifier-cron-guide.md`
