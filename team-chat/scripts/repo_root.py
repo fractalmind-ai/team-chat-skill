@@ -47,6 +47,49 @@ def _openclaw_workspace_from_path(path: Path) -> Optional[Path]:
     return None
 
 
+def _walk_up_for_data_root(start: Path) -> Optional[Path]:
+    """Walk up from *start* looking for a directory that looks like a data root.
+
+    A directory qualifies when it contains at least one of:
+    - a ``teams/`` subdirectory
+    - an ``AGENTS.md`` file
+    - a ``.agent/`` directory
+    """
+    current = start.resolve()
+    # Guard against symlink loops by capping iterations at a generous depth.
+    for _ in range(256):
+        if (current / "teams").is_dir():
+            return current
+        if (current / "AGENTS.md").is_file():
+            return current
+        if (current / ".agent").is_dir():
+            return current
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    return None
+
+
+def detect_data_root() -> Path:
+    """Auto-detect the data root directory.
+
+    Resolution order:
+    1. ``TEAM_CHAT_DATA_ROOT`` environment variable (highest priority).
+    2. Walk up from cwd looking for ``teams/``, ``AGENTS.md``, or ``.agent/``.
+    3. Fall back to :func:`get_repo_root` (git / OpenClaw heuristics).
+    """
+    env_data_root = os.environ.get("TEAM_CHAT_DATA_ROOT")
+    if env_data_root:
+        return Path(env_data_root).expanduser()
+
+    walked = _walk_up_for_data_root(Path.cwd())
+    if walked is not None:
+        return walked
+
+    return get_repo_root()
+
+
 def get_repo_root() -> Path:
     # Prefer an explicit env override for cron/agents.
     repo_root_env = os.environ.get("REPO_ROOT")
