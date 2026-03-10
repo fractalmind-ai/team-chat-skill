@@ -26,6 +26,13 @@ MESSAGE_TYPES = {
 }
 
 PRIORITIES = {"low", "normal", "high", "critical"}
+TASK_STATUSES = {
+    "assigned",
+    "in_progress",
+    "blocked",
+    "done",
+    "skipped",
+}
 IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 

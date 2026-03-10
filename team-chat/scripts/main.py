@@ -10,8 +10,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from protocol import MESSAGE_TYPES
-from repo_root import get_repo_root
+from protocol import MESSAGE_TYPES, TASK_STATUSES
+from repo_root import detect_data_root
 from service import TeamChatService, human_age_minutes, iso_to_local_string
 
 
@@ -261,8 +261,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="team-chat file-backed control-plane CLI")
     parser.add_argument(
         "--data-root",
-        default=str(get_repo_root()),
-        help="Repository root where teams/<team>/ state is stored",
+        default=str(detect_data_root()),
+        help=(
+            "Repository root where teams/<team>/ state is stored. "
+            "Auto-detected from $TEAM_CHAT_DATA_ROOT, or by walking up from "
+            "cwd looking for teams/, AGENTS.md, or .agent/"
+        ),
     )
     parser.add_argument("--json", action="store_true", help="Output JSON")
 
@@ -307,7 +311,7 @@ def build_parser() -> argparse.ArgumentParser:
     update_parser.add_argument("--from", dest="sender", required=True)
     update_parser.add_argument("--to", dest="recipient", required=True)
     update_parser.add_argument("--task-id", required=True)
-    update_parser.add_argument("--status")
+    update_parser.add_argument("--status", choices=sorted(TASK_STATUSES))
     update_parser.add_argument("--progress")
     update_parser.add_argument("--eta")
     blocked_group = update_parser.add_mutually_exclusive_group()
